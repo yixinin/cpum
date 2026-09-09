@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/src/assets/icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CPU Manager</title>
+    <style>
+      /* 只保留最外层壳占位 (AppBar + 工具栏空壳 + 一个空矩形),
+       * 绝不画假的表格行/列 —— 真正的占位行由 Vuetify v-data-table 内建
+       * loading 行在「表内部」完成, 避免「假页面 → 空真表 → 填数据」三段跳变。
+       */
+      html, body { margin: 0; padding: 0; height: 100%; background: #1e1e1e; color: #e9ecf1;
+        font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+      #app-skeleton { position: fixed; inset: 0; z-index: 1; background: #1e1e1e; display: flex; flex-direction: column; }
+
+      .sk-bar { height: 48px; background: #252526; display: flex; align-items: center;
+        padding: 0 16px; border-bottom: 1px solid #333; flex-shrink: 0; }
+      .sk-bar-icon { width: 22px; height: 22px; border-radius: 4px; background: #2a2a2b; margin-right: 10px; }
+      .sk-bar-title { font-size: 16px; color: #d6dae0; font-weight: 600; }
+      .sk-bar-chip { margin-left: 24px; height: 24px; width: 180px; background: #2a2a2b; border-radius: 999px; }
+      .sk-bar-chip-2 { margin-left: 8px; height: 24px; width: 150px; background: #2a2a2b; border-radius: 999px; }
+      .sk-bar-chip-3 { margin-left: 8px; height: 24px; width: 150px; background: #2a2a2b; border-radius: 999px; }
+
+      .sk-progress { height: 3px; background: #1a4e95; flex-shrink: 0;
+        background-image: linear-gradient(90deg, #1976D2 0%, #42a5f5 40%, #1976D2 80%);
+        background-size: 400% 100%; animation: sk-loading 1.2s linear infinite; opacity: 0.85; }
+      @keyframes sk-loading { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+
+      .sk-toolbar { height: 52px; background: #1e1e1e; display: flex; align-items: center;
+        padding: 0 16px; gap: 12px; border-bottom: 1px solid #2a2a2b; flex-shrink: 0; }
+      .sk-search { width: 280px; height: 36px; background: #2a2a2b; border-radius: 6px; }
+      .sk-toggle { width: 130px; height: 36px; background: #2a2a2b; border-radius: 6px; }
+      .sk-toggle-2 { width: 110px; height: 36px; background: #2a2a2b; border-radius: 6px; }
+      .sk-btn { width: 40px; height: 36px; background: #2a2a2b; border-radius: 6px; }
+      .sk-btn-slim { width: 60px; height: 36px; background: #2a2a2b; border-radius: 6px; }
+      .sk-spacer { flex: 1; }
+      .sk-btn-outline { width: 120px; height: 36px; background: #2a2a2b; border-radius: 6px; }
+      .sk-btn-bug { width: 40px; height: 36px; background: #2a2a2b; border-radius: 6px; }
+
+      /* 表格区域: 只是一个空矩形, 不画假行 —— 等 Vuetify 自己接管 */
+      .sk-table-area { flex: 1; background: #1e1e1e; }
+    </style>
+  </head>
+  <body>
+    <div id="app-skeleton">
+      <div class="sk-bar">
+        <div class="sk-bar-icon"></div>
+        <div class="sk-bar-title">CPU Manager</div>
+        <div class="sk-bar-chip"></div>
+        <div class="sk-bar-chip-2"></div>
+        <div class="sk-bar-chip-3"></div>
+      </div>
+      <div class="sk-progress"></div>
+      <div class="sk-toolbar">
+        <div class="sk-search"></div>
+        <div class="sk-toggle"></div>
+        <div class="sk-toggle-2"></div>
+        <div class="sk-btn-slim"></div>
+        <div class="sk-btn"></div>
+        <div class="sk-spacer"></div>
+        <div class="sk-btn-outline"></div>
+        <div class="sk-btn-bug"></div>
+      </div>
+      <div class="sk-table-area"></div>
+    </div>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+    <!-- 后备: 如果 main.ts 因任何原因 (模块加载失败/运行时错误) 没执行到 finally,
+         3 秒后强制移除骨架屏, 避免用户永远看到 mock UI -->
+    <script>
+      setTimeout(function () {
+        var s = document.getElementById("app-skeleton");
+        if (s) s.remove();
+      }, 3000);
+    </script>
+  </body>
+</html>

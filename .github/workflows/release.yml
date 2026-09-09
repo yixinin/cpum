@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            architecture: x64
+          - target: aarch64-pc-windows-msvc
+            architecture: arm64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Build architecture-specific service
+        shell: pwsh
+        run: |
+          # tauri_build validates configured bundle resources for every package
+          # build, including cpum_service itself. Create a temporary placeholder
+          # so its build script can run, then replace it with the real binary.
+          New-Item -ItemType Directory -Force -Path 'src-tauri/target/release' | Out-Null
+          New-Item -ItemType File -Force -Path 'src-tauri/target/release/cpum_service.exe' | Out-Null
+          cargo build --manifest-path src-tauri/Cargo.toml --release --target ${{ matrix.target }} --bin cpum_service
+          Copy-Item "src-tauri/target/${{ matrix.target }}/release/cpum_service.exe" 'src-tauri/target/release/cpum_service.exe'
+
+      - name: Set Tauri version from git tag
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          $path = 'src-tauri/tauri.conf.json'
+          $json = Get-Content $path | ConvertFrom-Json
+          $json.version = $version
+          $json | ConvertTo-Json -Depth 10 | Set-Content $path -NoNewline
+          Write-Host "Set tauri version to $version"
+
+      - name: Build NSIS installer
+        run: npx tauri build --bundles nsis --target ${{ matrix.target }}
+
+      - name: Prepare installer artifact
+        shell: pwsh
+        run: |
+          # Tauri writes Windows bundle output to its configured target directory,
+          # even when the Rust binary itself is cross-compiled for a target triple.
+          $installer = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'Tauri did not produce an NSIS installer.' }
+          New-Item -ItemType Directory -Force -Path 'release-artifact' | Out-Null
+          Copy-Item $installer.FullName "release-artifact/CPU-Manager_${{ github.ref_name }}_windows-${{ matrix.architecture }}-setup.exe"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.architecture }}-installer
+          path: release-artifact/*-setup.exe
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: windows-latest
+    env:
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+      SIGNPATH_PROJECT_SLUG: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+      SIGNPATH_SIGNING_POLICY_SLUG: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+      SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+
+    steps:
+      - name: Download installers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*-installer
+          merge-multiple: true
+          path: unsigned-installers
+
+      - name: Detect SignPath configuration
+        id: signing-config
+        shell: pwsh
+        run: |
+          $required = @(
+            $env:SIGNPATH_API_TOKEN,
+            $env:SIGNPATH_ORGANIZATION_ID,
+            $env:SIGNPATH_PROJECT_SLUG,
+            $env:SIGNPATH_SIGNING_POLICY_SLUG,
+            $env:SIGNPATH_ARTIFACT_CONFIGURATION_SLUG
+          )
+          $configured = @($required | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($configured.Count -eq 0) {
+            'enabled=false' >> $env:GITHUB_OUTPUT
+          } elseif ($configured.Count -eq $required.Count) {
+            'enabled=true' >> $env:GITHUB_OUTPUT
+          } else {
+            throw 'SignPath configuration is incomplete. Configure all five SignPath secrets or remove them all to publish an unsigned release.'
+          }
+
+      - name: Upload installers for SignPath
+        id: upload-unsigned-installers
+        if: ${{ steps.signing-config.outputs.enabled == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-installers-for-signpath
+          path: unsigned-installers/*-setup.exe
+          if-no-files-found: error
+
+      - name: Request SignPath signatures
+        if: ${{ steps.signing-config.outputs.enabled == 'true' }}
+        uses: SignPath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ env.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ env.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ env.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ env.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ env.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned-installers.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed-installers
+
+      - name: Verify installer signatures
+        if: ${{ steps.signing-config.outputs.enabled == 'true' }}
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem 'signed-installers' -Recurse -Filter '*-setup.exe')
+          if ($installers.Count -ne 2) { throw 'SignPath did not return both signed installers.' }
+          foreach ($installer in $installers) {
+            $signature = Get-AuthenticodeSignature $installer.FullName
+            if ($signature.Status -ne 'Valid') {
+              throw "Installer signature is not valid: $($installer.Name): $($signature.Status)"
+            }
+          }
+
+      - name: Prepare release artifacts
+        shell: pwsh
+        env:
+          SIGNING_ENABLED: ${{ steps.signing-config.outputs.enabled }}
+        run: |
+          $sourceRoot = if ($env:SIGNING_ENABLED -eq 'true') { 'signed-installers' } else { 'unsigned-installers' }
+          $installers = @(Get-ChildItem $sourceRoot -Recurse -Filter '*-setup.exe')
+          if ($installers.Count -ne 2) { throw "Expected two installers under $sourceRoot." }
+          New-Item -ItemType Directory -Force -Path 'release-artifacts' | Out-Null
+          Copy-Item $installers.FullName 'release-artifacts/'
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-artifacts/*-setup.exe
