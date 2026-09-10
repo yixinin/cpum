@@ -1,10 +1,24 @@
-﻿//! Windows 服务：CPU 亲和性规则守护进程
+//! Windows service: CPU affinity rule daemon + ProBalance dynamic optimizer.
 //!
-//! 安装后以 SYSTEM 身份运行，每 5 秒扫描一次进程并自动应用亲和性规则。
-//! 规则文件路径通过服务启动参数传入（安装时由 Tauri 命令自动设置）。
+//! Runs as SYSTEM after install:
+//! - Every 5 seconds, scans processes and automatically applies affinity
+//!   rules (mask / CPU Sets / three priority classes).
+//! - Every second, runs a ProBalance decision tick: detect foreground
+//!   contention, downgrade hot background processes (CPU BelowNormal +
+//!   very low IO), and auto-restore when contention clears / the downgrade
+//!   times out / the process exits.
+//!
+//! The rules file and the ProBalance config path are passed as service
+//! startup arguments (set automatically by the Tauri installer command).
+//! All rule loading / matching / application reuses the cpum-core engine -
+//! the GUI's "Apply rules" button goes through the same implementation, so
+//! behavior stays consistent by construction.
+//!
+//! Coordination with the rule engine: enabled rules that manage priorities
+//! form a "protected list"; matching processes are skipped by ProBalance to
+//! avoid the two engines clobbering each other's priority settings.
 
 use std::ffi::OsString;
-use std::sync::mpsc;
 use std::time::Duration;
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode,
@@ -14,61 +28,23 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_dispatcher;
 use windows_service::Result as WinSvcResult;
 
+use cpum_core::engine;
+use cpum_core::monitor::CpuSampler;
+use cpum_core::probalance::ProBalanceRuntime;
+use cpum_core::rule::AffinityRule;
+
 const SERVICE_NAME: &str = "CpumAffinityService";
 const RULES_DIR: &str = r"C:\ProgramData\cpum";
 
-/// 轮询间隔（秒）
-const POLL_INTERVAL_SECS: u64 = 5;
+/// Main loop tick interval (seconds) - ProBalance decision granularity.
+const TICK_INTERVAL_SECS: u64 = 1;
+/// Rule application interval (in ticks) - keeps the original 5-second cadence.
+const RULE_APPLY_TICKS: u64 = 5;
 
-// ---------- 规则模型 (与 cpum_lib::models::AffinityRule 保持一致) ----------
-
-use serde::Deserialize;
-use std::path::{Path, PathBuf};
-
-#[derive(Deserialize, Clone, Debug)]
-struct AffinityRule {
-    #[allow(dead_code)]
-    id: String,
-    process_name: String,
-    mask: String,
-    enabled: bool,
-    #[allow(dead_code)]
-    created_at: u64,
-    #[allow(dead_code)]
-    note: String,
-}
-
-// ---------- 规则文件 I/O ----------
-
-fn load_rules(base_dir: &Path) -> Result<Vec<AffinityRule>, String> {
-    let path = base_dir.join("affinity_rules.json");
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("读取规则文件: {e}"))?;
-    serde_json::from_str(&raw)
-        .map_err(|e| format!("解析规则文件: {e}"))
-}
-
-fn parse_hex_mask(s: &str) -> Result<u64, String> {
-    let trimmed = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    if trimmed.is_empty() {
-        return Err("mask 为空".into());
-    }
-    if trimmed.len() > 16 {
-        return Err("mask 超过 64 位".into());
-    }
-    u64::from_str_radix(trimmed, 16).map_err(|e| format!("解析 mask: {e}"))
-}
-
-fn name_matches(process_name: &str, rule_name: &str) -> bool {
-    let p = process_name.to_lowercase();
-    let r = rule_name.to_lowercase();
-    p == r || p == format!("{}.exe", r) || p.trim_end_matches(".exe") == r
-}
-
-// ---------- Win32 进程枚举（轻量版，无指标采集）----------
+// ---------- SeDebugPrivilege ----------
+// LocalSystem holds SeDebugPrivilege, but it may be disabled by default.
+// Enabling it is required to reliably open and modify affinity of processes
+// running in interactive user sessions.
 
 use windows::core::w;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, LUID, WIN32_ERROR, ERROR_NOT_ALL_ASSIGNED};
@@ -76,21 +52,10 @@ use windows::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES,
     TOKEN_PRIVILEGES, TOKEN_QUERY, SE_PRIVILEGE_ENABLED,
 };
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, SetProcessAffinityMask,
-    PROCESS_QUERY_INFORMATION, PROCESS_SET_INFORMATION,
+    GetCurrentProcess, OpenProcessToken,
 };
 
-struct SimpleProcess {
-    pid: u32,
-    name: String,
-}
-
-/// LocalSystem 持有 SeDebugPrivilege，但默认可能处于禁用状态。启用后才能
-/// 稳定地打开交互用户会话中的进程并修改亲和性。
 fn enable_debug_privilege() -> Result<(), String> {
     unsafe {
         let mut token = Default::default();
@@ -129,97 +94,33 @@ fn enable_debug_privilege() -> Result<(), String> {
 
         adjust_result.map_err(|e| format!("AdjustTokenPrivileges: {e}"))?;
         if last_error == ERROR_NOT_ALL_ASSIGNED {
-            return Err("当前服务账户不具备 SeDebugPrivilege".to_string());
+            return Err("current service account does not hold SeDebugPrivilege".to_string());
         }
     }
     Ok(())
 }
 
-fn enumerate_processes() -> Result<Vec<SimpleProcess>, String> {
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-            .map_err(|e| format!("CreateToolhelp32Snapshot: {e}"))?;
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        let mut processes = Vec::new();
-        if Process32FirstW(snapshot, &mut entry).is_ok() {
-            loop {
-                let name = String::from_utf16_lossy(
-                    &entry.szExeFile[..entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0)],
-                );
-                processes.push(SimpleProcess {
-                    pid: entry.th32ProcessID,
-                    name,
-                });
-                if Process32NextW(snapshot, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snapshot);
-        Ok(processes)
-    }
-}
-
-fn set_affinity(pid: u32, mask: u64) -> Result<(), String> {
-    unsafe {
-        let handle = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, false, pid)
-            .map_err(|e| format!("OpenProcess(PID {}): {}", pid, e))?;
-        let result = SetProcessAffinityMask(handle, mask as usize);
-        let _ = CloseHandle(handle);
-        result.map_err(|e| format!("SetProcessAffinityMask(PID {}): {}", pid, e))
-    }
-}
-
-/// 应用所有启用的规则，返回 (成功数, 失败数)
-fn apply_all_rules(base_dir: &Path) -> Result<(u32, u32), String> {
-    let rules = load_rules(base_dir)?;
-    let processes = enumerate_processes()?;
-    let mut ok = 0u32;
-    let mut fail = 0u32;
-
-    for rule in &rules {
-        if !rule.enabled {
-            continue;
-        }
-        let mask = match parse_hex_mask(&rule.mask) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        for p in &processes {
-            if name_matches(&p.name, &rule.process_name) {
-                match set_affinity(p.pid, mask) {
-                    Ok(_) => ok += 1,
-                    Err(_) => fail += 1,
-                }
-            }
-        }
-    }
-    Ok((ok, fail))
-}
-
-// ---------- Windows Service 主循环 ----------
+// ---------- Windows Service main loop ----------
 
 windows_service::define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(arguments: Vec<OsString>) {
-    // ServiceMain 的 argv[0] 是服务名；安装命令写入的规则目录从 argv[1] 开始。
+    // ServiceMain's argv[0] is the service name; the rules directory written
+    // by the install command comes in starting from argv[1].
     let rules_dir = arguments
         .get(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(RULES_DIR));
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(RULES_DIR));
 
     if let Err(e) = run_service(rules_dir) {
         eprintln!("Service fatal: {e}");
     }
 }
 
-fn run_service(rules_dir: PathBuf) -> WinSvcResult<()> {
+fn run_service(rules_dir: std::path::PathBuf) -> WinSvcResult<()> {
     enable_debug_privilege()
         .map_err(|message| windows_service::Error::Winapi(std::io::Error::other(message)))?;
-    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
 
     let status_handle = service_control_handler::register(
         SERVICE_NAME,
@@ -244,13 +145,48 @@ fn run_service(rules_dir: PathBuf) -> WinSvcResult<()> {
         process_id: None,
     })?;
 
-    // 主循环：每 POLL_INTERVAL_SECS 秒扫描一次
+    // Main loop: one ProBalance tick per second; every 5 ticks apply rules
+    // and refresh the protected list.
+    // - The rule engine only counts failures for a single rule/process and
+    //   does not abort the run; we ignore the return value and retry next
+    //   round.
+    // - When ProBalance is disabled, only write a status heartbeat (proves
+    //   the service is alive) - no sampling, no decisions.
+    // - The protected list = enabled rules that manage priorities; matching
+    //   processes are never downgraded by ProBalance.
+    let mut pb = ProBalanceRuntime::new(&rules_dir);
+    let mut sampler = CpuSampler::new();
+    let mut protecting_rules: Vec<AffinityRule> = Vec::new();
+    let mut tick_count: u64 = 0;
+
     loop {
-        let _ = apply_all_rules(&rules_dir);
-        if shutdown_rx.recv_timeout(Duration::from_secs(POLL_INTERVAL_SECS)).is_ok() {
+        if tick_count % RULE_APPLY_TICKS == 0 {
+            match cpum_core::store::load_rules(&rules_dir) {
+                Ok(rules) => {
+                    protecting_rules = rules
+                        .iter()
+                        .filter(|r| r.enabled && r.manages_priorities())
+                        .cloned()
+                        .collect();
+                    if let Err(e) = engine::apply_rules(&rules) {
+                        eprintln!("Apply rules failed: {e}");
+                    }
+                }
+                Err(e) => eprintln!("Load rules failed: {e}"),
+            }
+        }
+
+        pb.tick(&rules_dir, &mut sampler, &protecting_rules);
+
+        tick_count = tick_count.wrapping_add(1);
+        if shutdown_rx.recv_timeout(Duration::from_secs(TICK_INTERVAL_SECS)).is_ok() {
             break;
         }
     }
+
+    // Before stopping, restore all processes downgraded by ProBalance
+    // (write back the original priorities + log the action).
+    pb.shutdown(&rules_dir);
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -265,23 +201,23 @@ fn run_service(rules_dir: PathBuf) -> WinSvcResult<()> {
     Ok(())
 }
 
-// ---------- 入口 ----------
+// ---------- Entry point ----------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
-    // --apply-once <dir>  测试模式：执行一次后退出
+    // --apply-once <dir>  test mode: run once and exit
     if args.get(1).map(|s| s.as_str()) == Some("--apply-once") {
         let dir = args
             .get(2)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(RULES_DIR));
-        let (ok, fail) = apply_all_rules(&dir)?;
-        println!("Applied: {ok} ok, {fail} failed");
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(RULES_DIR));
+        let report = engine::apply_rules_from_dir(&dir)?;
+        println!("Applied: {} ok, {} failed", report.applied, report.failed);
         return Ok(());
     }
 
-    // 正常模式：作为 Windows 服务运行
+    // Normal mode: run as a Windows service.
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)?;
     Ok(())
 }

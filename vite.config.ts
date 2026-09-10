@@ -9,7 +9,7 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [
     vue(),
-    // Vuetify 自动导入 + sass 变量注入
+    // Vuetify: auto-import components + inject sass variables
     vuetify({ autoImport: true, styles: { configFile: "src/settings.scss" } }),
   ],
 

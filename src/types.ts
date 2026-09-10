@@ -1,9 +1,13 @@
-// 与 Rust 端 models.rs 一一对应的前端类型定义
-// 注: affinity mask 以十六进制字符串形式传输 (如 "0xFFFFFFFF"),
-//      以兼容 64 位全 1 (Threadripper 64+ 线程全选) 的情况。
+// Frontend type definitions mirroring Rust models.rs one-to-one.
+// Note: affinity masks are transported as hex strings (e.g. "0xFFFFFFFF")
+//       so 64-bit all-ones (Threadripper with 64+ threads, all selected) round-trip cleanly.
+
+import { t } from "./i18n";
 
 export interface LogicalProcessorInfo {
   index: number;
+  group: number;
+  group_index: number;
   core_id: number;
   die_id: number;
   package_id: number;
@@ -34,6 +38,7 @@ export interface CpuTopology {
   cores: CoreInfo[];
   dies: DieInfo[];
   total_logical_processors: number;
+  group_count: number;
   single_group: boolean;
 }
 
@@ -49,57 +54,69 @@ export interface ProcessDisplay {
   mem_text: string;
   disk_r_text: string;
   disk_w_text: string;
-  /** 网络下载 (BytesIn) 速率文本 — 避免每次渲染都重算 */
+  /** Pre-formatted download rate text (BytesIn) — avoids re-formatting every render */
   net_in_text: string;
-  /** 网络上传 (BytesOut) 速率文本 */
+  /** Pre-formatted upload rate text (BytesOut) */
   net_out_text: string;
-  /** CPU 颜色 #RRGGBB — 避免每次渲染都重算 */
+  /** CPU color #RRGGBB — pre-computed, avoids re-computing every render */
   cpu_color: string;
-  /** 亲和性 Mask 短格式 (超过 12 字符折叠) */
+  /** Short form of the affinity mask (folded when longer than 12 chars) */
   mask_short: string;
-  /** 亲和性 Mask 对应的选中逻辑处理器数 */
+  /** Number of selected logical processors corresponding to the affinity mask */
   mask_bits: number;
-  /** 按 CCD 分组的启用线程数 (亲和性可视化色块) — mask 变化时刷新 */
+  /** Enabled-thread count grouped by CCD (used for the affinity visualization swatches); refreshes on mask change */
   ccd_bars: CcdBar[];
 }
 
 export interface ProcessInfo {
   pid: number;
   name: string;
+  /** Full executable path (Win32 path; null for fast-skip / protected processes) */
+  exe_path: string | null;
   affinity_mask: string | null;
   system_affinity_mask: string | null;
+  group_affinity_masks: string[] | null;
+  /** System-available LPs in each processor group (not the process's current mask). */
+  group_system_affinity_masks: string[] | null;
   parent_pid: number;
   access_denied: boolean;
-  // ---------- 资源使用率 (后端 delta 采样得到) ----------
-  /** CPU 使用率 (0.0 ~ N*100.0, N = 逻辑处理器数) */
+  // ---------- Process priorities (aligned with Rust models.rs) ----------
+  /** CPU priority class raw value (0x20=Normal, 0x4000=BelowNormal, ...); null = unreadable */
+  priority_class: number | null;
+  /** I/O priority (0=VeryLow, 1=Low, 2=Normal); null = unreadable */
+  io_priority: number | null;
+  /** Memory priority (1=VeryLow ... 5=Normal); null = unreadable */
+  memory_priority: number | null;
+  // ---------- Resource usage (computed from backend delta sampling) ----------
+  /** CPU usage in 0.0 .. N*100.0 (N = number of logical processors) */
   cpu_usage_percent: number;
-  /** Working Set 物理内存工作集, 字节 */
+  /** Working-set physical memory, in bytes */
   memory_bytes: number;
-  /** Disk 读速率, bytes/sec */
+  /** Disk read rate, bytes/sec */
   disk_read_bps: number;
-  /** Disk 写速率, bytes/sec */
+  /** Disk write rate, bytes/sec */
   disk_write_bps: number;
   /**
-   * Disk 读写总速率, bytes/sec (前端派生 = read + write)。
-   * 仅用于「磁盘」合并列的排序 key; 后端不输出此字段。
+   * Total disk read+write rate, bytes/sec (frontend-derived = read + write).
+   * Used only as the sort key for the merged "Disk" column; the backend does not emit this field.
    */
   disk_total_bps: number;
-  /** 网络下载速率 (BytesIn delta / dt), bytes/sec。Win11 24H2+ 才有, 老版本恒 0 */
+  /** Net download rate (BytesIn delta / dt), bytes/sec. Available on Win11 24H2+; always 0 on older releases */
   net_in_bps: number;
-  /** 网络上传速率 (BytesOut delta / dt), bytes/sec。同 net_in_bps */
+  /** Net upload rate (BytesOut delta / dt), bytes/sec. Same availability as net_in_bps */
   net_out_bps: number;
   /**
-   * 网络上下行总速率, bytes/sec (前端派生 = in + out)。
-   * 仅用于「网络」合并列的排序 key; 后端不输出此字段。
+   * Total net up+down rate, bytes/sec (frontend-derived = in + out).
+   * Used only as the sort key for the merged "Net" column; the backend does not emit this field.
    */
   net_total_bps: number;
-  /** 模板端显示缓存 — 由 refreshDisplayCache() 维护, 避免每帧重复格式化 */
+  /** Per-process template-side display cache — maintained by refreshDisplayCache() to avoid re-formatting every frame */
   _display: ProcessDisplay;
 }
 
-// ---------- 使用率格式化工具 ----------
+// ---------- Usage formatting utilities ----------
 
-/** 把 bytes/sec 格式化为 KB/s / MB/s / GB/s 自适应 */
+/** Format bytes/sec with adaptive KB/s / MB/s / GB/s units */
 export function formatBps(bps: number): string {
   if (!Number.isFinite(bps) || bps <= 0) return "0 B/s";
   const units = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"];
@@ -113,7 +130,7 @@ export function formatBps(bps: number): string {
   return `${v.toFixed(digits)} ${units[i]}`;
 }
 
-/** 把 bytes 内存大小格式化为 KB/MB/GB */
+/** Format a memory byte count as KB / MB / GB */
 export function formatMemory(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -127,23 +144,23 @@ export function formatMemory(bytes: number): string {
   return `${v.toFixed(digits)} ${units[i]}`;
 }
 
-// ---------- mask 工具函数 ----------
+// ---------- Mask utility functions ----------
 
-/** 将十六进制字符串解析为 bigint */
+/** Parse a hex string (with optional 0x prefix) into a bigint */
 export function parseMask(hex: string | null): bigint {
   if (!hex) return 0n;
-  // 兼容 "0x..." 前缀
+  // Tolerate an optional "0x" prefix
   const s = hex.trim().replace(/^0x/i, "");
   if (s === "") return 0n;
   return BigInt("0x" + s);
 }
 
-/** 将 bigint 格式化为带前缀的十六进制字符串 */
+/** Format a bigint as a prefixed hex string */
 export function formatMask(mask: bigint): string {
   return "0x" + mask.toString(16).toUpperCase();
 }
 
-/** 统计 mask 中置位的位数 (启用的逻辑处理器数) */
+/** Count the set bits in a mask (= number of enabled logical processors) */
 export function popcount(mask: bigint): number {
   let n = 0n;
   let m = mask;
@@ -154,18 +171,128 @@ export function popcount(mask: bigint): number {
   return Number(n);
 }
 
-/** 读取 mask 指定位 (bit 索引从 0 起) 的状态 */
+/** Read a single bit from the mask (bit index starts at 0) */
 export function getBit(mask: bigint, bit: number): boolean {
   return (mask & (1n << BigInt(bit))) !== 0n;
 }
 
-/** 置位 / 清除 mask 的指定位 */
+/** Set or clear a single bit in the mask */
 export function setBit(mask: bigint, bit: number, value: boolean): bigint {
   const b = 1n << BigInt(bit);
   return value ? (mask | b) : (mask & ~b);
 }
 
-// ---------- ProcessDisplay 缓存工具 (避免模板每帧重格式化) ----------
+// ---------- Rule types (aligned with Rust cpum_core::rule) ----------
+
+/** Rule match mode: exact = exact name, wildcard = glob, path = full path */
+export type RuleMatchType = "exact" | "wildcard" | "path";
+
+/** Scheduling mode: strict = hard mask, soft = elastic CPU Sets */
+export type RuleMode = "strict" | "soft";
+
+/** Match-mode options (labelKey points at a key in i18n.ts) */
+export const MATCH_TYPE_OPTIONS: Array<{ value: RuleMatchType; labelKey: string }> = [
+  { value: "exact", labelKey: "matchExact" },
+  { value: "wildcard", labelKey: "matchWildcard" },
+  { value: "path", labelKey: "matchPath" },
+];
+
+/** Scheduling-mode options */
+export const RULE_MODE_OPTIONS: Array<{ value: RuleMode; labelKey: string }> = [
+  { value: "strict", labelKey: "modeStrict" },
+  { value: "soft", labelKey: "modeSoft" },
+];
+
+/** CPU priority class raw values (Win32 PROCESS_CREATION_FLAGS) */
+export const PRIORITY_CLASS = {
+  IDLE: 0x40,
+  BELOW_NORMAL: 0x4000,
+  NORMAL: 0x20,
+  ABOVE_NORMAL: 0x8000,
+  HIGH: 0x80,
+  REALTIME: 0x100,
+} as const;
+
+/** CPU priority tiers (high to low); labelKey points at a key in i18n.ts */
+export const PRIORITY_CLASS_OPTIONS: Array<{ value: number; labelKey: string }> = [
+  { value: PRIORITY_CLASS.REALTIME, labelKey: "prioRealtime" },
+  { value: PRIORITY_CLASS.HIGH, labelKey: "prioHigh" },
+  { value: PRIORITY_CLASS.ABOVE_NORMAL, labelKey: "prioAboveNormal" },
+  { value: PRIORITY_CLASS.NORMAL, labelKey: "prioNormal" },
+  { value: PRIORITY_CLASS.BELOW_NORMAL, labelKey: "prioBelowNormal" },
+  { value: PRIORITY_CLASS.IDLE, labelKey: "prioIdle" },
+];
+
+/** I/O priority tiers (3=High is reserved for the system and not exposed) */
+export const IO_PRIORITY_OPTIONS: Array<{ value: number; labelKey: string }> = [
+  { value: 2, labelKey: "prioNormal" },
+  { value: 1, labelKey: "prioLow" },
+  { value: 0, labelKey: "prioVeryLow" },
+];
+
+/** Memory priority tiers (Win32 MEMORY_PRIORITY: 1=VeryLow ... 5=Normal) */
+export const MEMORY_PRIORITY_OPTIONS: Array<{ value: number; labelKey: string }> = [
+  { value: 5, labelKey: "prioNormal" },
+  { value: 4, labelKey: "prioBelowNormal" },
+  { value: 3, labelKey: "prioMedium" },
+  { value: 2, labelKey: "prioLow" },
+  { value: 1, labelKey: "prioVeryLow" },
+];
+
+/** Color for non-Normal CPU priority tiers (used in the process list column) */
+export const PRIORITY_CLASS_COLORS: Record<number, string> = {
+  [PRIORITY_CLASS.REALTIME]: "#EF5350",
+  [PRIORITY_CLASS.HIGH]: "#FFA726",
+  [PRIORITY_CLASS.ABOVE_NORMAL]: "#FFB74D",
+  [PRIORITY_CLASS.BELOW_NORMAL]: "#42A5F5",
+  [PRIORITY_CLASS.IDLE]: "#90A4AE",
+};
+
+// ---------- Priority display utilities ----------
+// Labels are computed at render time (a lightweight switch), stay reactive
+// to locale changes, and are intentionally not cached in _display.
+
+/** CPU priority class raw value -> short label */
+export function priorityClassLabel(pc: number | null): string {
+  if (pc === null) return "-";
+  switch (pc) {
+    case PRIORITY_CLASS.REALTIME: return t("prioRealtime");
+    case PRIORITY_CLASS.HIGH: return t("prioHigh");
+    case PRIORITY_CLASS.ABOVE_NORMAL: return t("prioAboveNormal");
+    case PRIORITY_CLASS.NORMAL: return t("prioNormal");
+    case PRIORITY_CLASS.BELOW_NORMAL: return t("prioBelowNormal");
+    case PRIORITY_CLASS.IDLE: return t("prioIdle");
+    default: return `0x${pc.toString(16).toUpperCase()}`;
+  }
+}
+
+/** I/O priority -> short label */
+export function ioPriorityLabel(io: number | null): string {
+  if (io === null) return "-";
+  if (io === 2) return t("prioNormal");
+  if (io === 1) return t("prioLow");
+  if (io === 0) return t("prioVeryLow");
+  return String(io);
+}
+
+/** Memory priority -> short label */
+export function memoryPriorityLabel(mp: number | null): string {
+  if (mp === null) return "-";
+  if (mp === 5) return t("prioNormal");
+  if (mp === 4) return t("prioBelowNormal");
+  if (mp === 3) return t("prioMedium");
+  if (mp === 2) return t("prioLow");
+  if (mp === 1) return t("prioVeryLow");
+  return String(mp);
+}
+
+/** Returns the label color for non-Normal CPU priority tiers; empty string for Normal / unknown */
+export function priorityClassColor(pc: number | null): string {
+  if (pc === null || pc === PRIORITY_CLASS.NORMAL) return "";
+  return PRIORITY_CLASS_COLORS[pc] ?? "";
+}
+
+// ---------- ProcessDisplay cache utilities (avoids re-formatting every template frame) ----------
 
 export function emptyDisplay(): ProcessDisplay {
   return {
@@ -182,12 +309,12 @@ export function emptyDisplay(): ProcessDisplay {
   };
 }
 
-/** CCD 色块配色 (与 App.vue CCD_TABLE_COLORS 保持一致) */
+/** CCD swatch palette (kept in sync with App.vue CCD_TABLE_COLORS) */
 export const CCD_COLORS = ["#42A5F5", "#66BB6A", "#FFA726", "#EF5350", "#AB47BC", "#26C6DA", "#FFEE58", "#8D6E63"];
 
 /**
- * 刷新 _display.ccd_bars: 按 topology.dies 分组统计 mask 中启用的线程数。
- * 只在 mask 变化 或 topology 变化 时调用 (而不是每帧渲染)。
+ * Refresh _display.ccd_bars: per-die enabled-thread counts derived from the mask.
+ * Call only on mask change or topology change — not every frame.
  */
 export function refreshCcdBars(p: ProcessInfo, topology: CpuTopology | null) {
   if (!topology) {
@@ -204,10 +331,10 @@ export function refreshCcdBars(p: ProcessInfo, topology: CpuTopology | null) {
   }));
 }
 
-/** CPU 百分比显示基准: per-core = 单核 100%, overall = 整体 CPU 100% (与任务管理器右键切换一致) */
+/** CPU percent scale: per-core = 100% per single core, overall = 100% across all CPUs (matches Task Manager right-click toggle) */
 export type CpuScaleMode = "per-core" | "overall";
 
-/** 把 CPU 百分比格式化为 1 位小数, 无小数时取整 */
+/** Format a CPU percent to 1 decimal place, dropping the decimal when it's whole */
 export function formatCpuPercent(p: number): string {
   if (!Number.isFinite(p) || p <= 0) return "0%";
   if (p < 1) return "<1%";
@@ -215,16 +342,16 @@ export function formatCpuPercent(p: number): string {
 }
 
 /**
- * 根据 mode 把后端原始 cpu_percent (单核基准) 归一化为显示值。
- * - per-core: 原值返回 (100% = 单核满载)
- * - overall:  除以 nproc (100% = 全部 LP 满载)
+ * Normalize the backend's raw (per-core baseline) cpu_percent to a display value for the given mode.
+ * - per-core: returned as-is (100% = one core saturated)
+ * - overall:  divided by nproc (100% = all LPs saturated)
  */
 export function scaleCpuPercent(p: number, mode: CpuScaleMode, nproc: number): number {
   if (mode === "overall" && nproc > 1) return p / nproc;
   return p;
 }
 
-/** 计算 CPU 颜色: 低灰/绿/橙/红 */
+/** CPU color: low = gray, mid-low = green, mid = orange, high = red */
 export function cpuColor(p: number, baseline: number): string {
   const ratio = Math.min(1, baseline > 0 ? p / baseline : 0);
   if (ratio >= 0.75) return "#EF5350";
@@ -234,13 +361,14 @@ export function cpuColor(p: number, baseline: number): string {
 }
 
 /**
- * 就地刷新 ProcessInfo._display 缓存。
- * 只在 metrics 写入 / 进程 diff / 亲和性更新 后对受影响对象调用一次,
- * 而不是在模板的每个 cell 中 每帧 计算。
+ * In-place refresh of ProcessInfo._display cache.
+ * Call this once per affected process after a metrics write / process diff /
+ * affinity update — never per template cell, per frame.
  *
- * @param baseline CPU 使用率基线 = 逻辑处理器数 × 100 (per-core) 或 100 (overall)
- * @param cpuMode CPU 显示基准模式, 默认 per-core
- * @param nproc 逻辑处理器数, 用于 overall 模式归一化
+ * @param baseline CPU usage baseline = logical processor count * 100 (per-core) or 100 (overall)
+ * @param opts which fields to refresh (defaults: all)
+ * @param cpuMode CPU display mode; defaults to per-core
+ * @param nproc logical processor count, used to normalize in overall mode
  */
 export function refreshDisplayCache(
   p: ProcessInfo,
@@ -282,4 +410,77 @@ export function refreshDisplayCache(
       d.mask_bits = popcount(parseMask(mask));
     }
   }
+}
+
+// ==========================================================================
+// ProBalance dynamic-optimization engine (aligned with Rust cpum_core::probalance)
+// ==========================================================================
+
+/** ProBalance config (edited by the GUI / hot-reloaded by the service; persisted as probalance.json) */
+export interface ProBalanceConfig {
+  /** Master switch (off = engine idle; any downgraded processes are restored immediately) */
+  enabled: boolean;
+  /** Foreground-process CPU trigger threshold (per-core baseline %; 100 = one core fully consumed) */
+  fg_cpu_threshold: number;
+  /** Background-process CPU downgrade threshold (per-core baseline %) */
+  bg_cpu_threshold: number;
+  /** Contention must persist for this many seconds (debounce against transient spikes) */
+  sustain_secs: number;
+  /** Seconds to wait after contention clears before restoring (hysteresis, prevents flapping) */
+  restore_after_secs: number;
+  /** Per-process max downgrade duration (seconds); auto-restore on timeout (safety net) */
+  max_downgrade_secs: number;
+  /** User-supplied allowlist (supports wildcards; system-critical processes are already hard-coded) */
+  whitelist: string[];
+  /** Opt-in fullscreen policy: boost the verified fullscreen foreground process and reuse ProBalance for background suppression. */
+  game_mode_enabled: boolean;
+}
+
+/** Snapshot of the three priority classes (aligned with Rust ProcessPriorities; null = read failed / unsupported) */
+export interface PbPriorities {
+  priority_class: number | null;
+  io_priority: number | null;
+  memory_priority: number | null;
+}
+
+/** Real-time engine status from the service (overwrites the status file every second; ts lets the GUI liveness-check the service) */
+export interface PbStatus {
+  /** Write time (Unix seconds) — the GUI uses freshness to determine whether the service is alive */
+  ts: number;
+  enabled: boolean;
+  /** Whether the engine is currently in a downgrade state (contention ongoing) */
+  engaged: boolean;
+  /** Number of processes currently downgraded */
+  downgraded: number;
+  fg_pid: number | null;
+  fg_cpu_percent: number | null;
+  game_mode_active: boolean;
+}
+
+/** A single ProBalance action log entry (downgrade / restore / exit) */
+export interface PbLogEntry {
+  /** Unix seconds */
+  ts: number;
+  /** "downgrade" | "restore" | "exit" */
+  action: string;
+  /** Restore reason: contention_cleared / timeout / process_exited / disabled / shutdown */
+  reason: string | null;
+  pid: number;
+  name: string;
+  /** CPU usage at downgrade time (per-core baseline %) */
+  cpu: number | null;
+  from: PbPriorities | null;
+  to: PbPriorities | null;
+}
+
+export interface LogicalProcessorUsage {
+  index: number;
+  usage_percent: number;
+}
+
+export interface PbStatistics {
+  downgrade_count: number;
+  restore_count: number;
+  exit_count: number;
+  unique_processes: number;
 }

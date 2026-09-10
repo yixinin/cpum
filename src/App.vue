@@ -1,8 +1,9 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
 import type { ProcessInfo, CpuScaleMode } from "./types";
-import { refreshDisplayCache, formatMemory } from "./types";
-import { getServiceStatus, installService, uninstallService, startService, stopService, type ServiceStatus } from "./api";
+import { refreshDisplayCache, formatMemory, priorityClassLabel, ioPriorityLabel, memoryPriorityLabel, priorityClassColor } from "./types";
+import { getServiceStatus, getProcessExePath, getLogicalProcessorUsage, installService, uninstallService, startService, stopService, type ServiceStatus } from "./api";
+import type { LogicalProcessorUsage } from "./types";
 import type { SortItem, ViewMode } from "./constants";
 import { useTopology } from "./composables/useTopology";
 import { useProcessManager } from "./composables/useProcessManager";
@@ -10,6 +11,15 @@ import { useMetricsStream } from "./composables/useMetricsStream";
 import { buildProcessTree, flattenTree, computeSearchWhitelist, filterTree, countChildren, toggleTreeNodeExpand, type TableRow } from "./composables/useProcessTree";
 import AffinityEditor from "./components/AffinityEditor.vue";
 import AffinityRuleManager from "./components/AffinityRuleManager.vue";
+import ProBalancePanel from "./components/ProBalancePanel.vue";
+import { useI18n } from "./i18n";
+import { useTheme } from "./composables/useTheme";
+const { t, toggleLocale } = useI18n();
+const { theme, toggleTheme } = useTheme();
+
+// Theme button: the icon / tooltip show the theme the user will switch TO, not the current one
+const themeIcon = computed(() => (theme.value === "dark" ? "mdi-weather-sunny" : "mdi-weather-night"));
+const themeTooltip = computed(() => (theme.value === "dark" ? t("themeLight") : t("themeDark")));
 
 // ---------- Composables ----------
 const { topology, totalLps, cpuBaseline, init: initTopology } = useTopology();
@@ -44,6 +54,12 @@ const expandedPids = ref<number[]>([]);
 const sortBy = ref<readonly SortItem[]>([{ key: "cpu_usage_percent", order: "desc" }]);
 const tableCardRef = ref<HTMLElement | null>(null);
 const tableHeight = ref(480);
+const logicalProcessorUsage = ref<LogicalProcessorUsage[]>([]);
+let coreUsageTimer: ReturnType<typeof setInterval> | null = null;
+
+async function refreshLogicalProcessorUsage() {
+  try { logicalProcessorUsage.value = await getLogicalProcessorUsage(); } catch { /* unsupported or transient failure */ }
+}
 
 // Affinity editor
 const editorOpen = ref(false);
@@ -51,6 +67,8 @@ const editingProcess = ref<ProcessInfo | null>(null);
 
 // Rule manager
 const ruleManagerOpen = ref(false);
+// ProBalance dynamic optimization panel
+const pbPanelOpen = ref(false);
 // Service management
 const serviceDialogOpen = ref(false);
 const serviceStatus = ref<ServiceStatus>("not_installed");
@@ -67,12 +85,28 @@ const ctxMenu = ref({ open: false, x: 0, y: 0, type: null as "processRow" | "cpu
 
 // CPU scale
 const cpuScaleIcon = computed(() => cpuScaleMode.value === "overall" ? "mdi-cpu-64-bit" : "mdi-chip");
-const cpuScaleTooltip = computed(() => cpuScaleMode.value === "overall" ? "显示: 整体 CPU (类伻任务管理器)" : "显示: 单核基准 (每核 100%)");
+const cpuScaleTooltip = computed(() => cpuScaleMode.value === "overall" ? t("cpuScaleOverall") : t("cpuScalePerCore"));
+
+// CPU info bar: die-group badge (multi-die highlighted; labeled "CCD" vs "Die" per die.is_ccd)
+const isMultiDie = computed(() => (topology.value?.dies.length ?? 0) > 1);
+const dieGroupLabel = computed(() => {
+  const dies = topology.value?.dies;
+  if (!dies || dies.length === 0) return "";
+  return dies.some((d) => d.is_ccd) ? "CCD" : "Die";
+});
 
 // ---------- Derived ----------
 const streaming = metricsStream.streaming;
 const toggleStreamingBusy = metricsStream.toggleBusy;
 const toggleStreaming = metricsStream.toggle;
+const cpuHistory = metricsStream.cpuHistory;
+
+function cpuSparkline(pid: number): string {
+  const values = cpuHistory(pid);
+  if (values.length < 2) return "";
+  const peak = Math.max(1, ...values);
+  return values.map((value, index) => `${(index / (values.length - 1)) * 58},${18 - (value / peak) * 16}`).join(" ");
+}
 
 const processCount = computed(() => processes.value.filter(p => !p.access_denied).length);
 
@@ -123,11 +157,22 @@ function openEditor(p: ProcessInfo) {
 }
 
 function onApplied() {
-  showSnack("亲和性规则已应用", "success");
+  showSnack(t("rulesApplied"), "success");
+}
+
+/** Non-Normal priority tier coloring for the priority column (Realtime/High = orange-red; BelowNormal/Idle = blue-gray) */
+function prioStyle(p: ProcessInfo) {
+  const color = priorityClassColor(p.priority_class);
+  return color ? { color, fontWeight: 600 } : undefined;
+}
+
+/** Priority column tooltip: shows all three priority classes in detail */
+function priorityTooltip(p: ProcessInfo): string {
+  return `${t("prioCpu")}: ${priorityClassLabel(p.priority_class)}\n${t("prioIo")}: ${ioPriorityLabel(p.io_priority)}\n${t("prioMem")}: ${memoryPriorityLabel(p.memory_priority)}`;
 }
 
 function onRulesApplied(count: number) {
-  showSnack(`Rules applied to ${count}  processes`, "success");
+  showSnack(t("rulesAppliedTo", { count }), "success");
   refreshFull();
 }
 
@@ -185,29 +230,46 @@ function onScrollClose() { if (ctxMenu.value.open) ctxMenu.value.open = false; }
 
 function ctxEdit() { const p = ctxMenu.value.process; if (p) openEditor(p); closeContextMenu(); }
 function ctxReset() { const p = ctxMenu.value.process; if (p) resetAffinity(p); closeContextMenu(); }
-function ctxCopy(field: "pid" | "name" | "mask" | "all") {
+
+/** Process path: prefer the enumeration result, otherwise query the backend on demand and backfill the row */
+async function resolveProcessPath(p: ProcessInfo): Promise<string | null> {
+  if (p.exe_path) return p.exe_path;
+  const path = await getProcessExePath(p.pid).catch(() => null);
+  if (path) p.exe_path = path;
+  return path;
+}
+
+function ctxCopy(field: "pid" | "name" | "mask" | "path" | "all") {
   const p = ctxMenu.value.process;
   if (!p) return;
+  if (field === "path") {
+    resolveProcessPath(p).then((path) => {
+      if (path) copyText(path);
+      else showSnack(t("pathUnavailable"), "error");
+    });
+    closeContextMenu();
+    return;
+  }
   let text = "";
   if (field === "pid") text = String(p.pid);
   else if (field === "name") text = p.name;
   else if (field === "mask") text = p.affinity_mask ?? "";
-  else text = `PID: ${p.pid}\nName: ${p.name}\nAffinity: ${p.affinity_mask ?? "-"}\nCPU: ${p._display.cpu_text}\nMem: ${formatMemory(p.memory_bytes)}`;
+  else text = `PID: ${p.pid}\n${t("name")}: ${p.name}\n${t("path")}: ${p.exe_path ?? t("unavailable")}\n${t("affinity")}: ${p.affinity_mask ?? "-"}\n${t("priority")}: ${priorityClassLabel(p.priority_class)}\n${t("cpu")}: ${p._display.cpu_text}\n${t("memory")}: ${formatMemory(p.memory_bytes)}`;
   copyText(text);
   closeContextMenu();
 }
 function ctxCopyCpuInfo() {
   if (!topology.value) return;
-  const t = topology.value;
-  copyText(`Logical Processors: ${t.total_logical_processors}\nCores: ${t.cores.length}\nDies/CCDs: ${t.dies.length}`);
+  const topo = topology.value;
+  copyText(`${t("logicalProcessors")}: ${topo.total_logical_processors}\n${t("cores")}: ${topo.cores.length}\n${t("dies")}: ${topo.dies.length}`);
   closeContextMenu();
 }
 function ctxRefreshTopology() { initTopology(); closeContextMenu(); }
 
 function copyText(text: string) {
   navigator.clipboard?.writeText(text).then(
-    () => showSnack("Copied to clipboard", "success"),
-    () => showSnack("Copy failed", "error"),
+    () => showSnack(t("copied"), "success"),
+    () => showSnack(t("copyFailed"), "error"),
   );
 }
 
@@ -233,6 +295,8 @@ onMounted(() => {
   // Register metrics listeners and start streaming
   metricsStream.register();
   metricsStream.start();
+  refreshLogicalProcessorUsage();
+  coreUsageTimer = setInterval(refreshLogicalProcessorUsage, 1000);
 
   // Bootstrap topology + processes in parallel
   initTopology();
@@ -253,14 +317,15 @@ onUnmounted(() => {
   window.removeEventListener("scroll", onScrollClose, true);
   window.removeEventListener("resize", updateTableHeight);
   metricsStream.unregister();
+  if (coreUsageTimer) clearInterval(coreUsageTimer);
 });
 // ---------- Service Management ----------
 const serviceStatusText = computed(() => {
   switch (serviceStatus.value) {
-    case "running": return "服务运行中。开机时自动应用规则。";
-    case "stopped": return "服务已安装但已停止。";
-    case "not_installed": return "服务未安装。安装后可开机自动应用规则。";
-    default: return `Service status: ${serviceStatus.value}`;
+    case "running": return t("serviceRunning");
+    case "stopped": return t("serviceStopped");
+    case "not_installed": return t("serviceMissing");
+    default: return t("serviceStatusUnknown", { status: serviceStatus.value });
   }
 });
 async function refreshServiceStatus() {
@@ -268,7 +333,7 @@ async function refreshServiceStatus() {
   try {
     serviceStatus.value = await getServiceStatus();
   } catch (e: any) {
-    serviceMessage.value = `Query failed: ${e}`;
+    serviceMessage.value = t("queryFailed", { error: String(e) });
   } finally {
     serviceLoading.value = false;
   }
@@ -290,7 +355,7 @@ async function doInstallService() {
     showSnack(msg, "success");
   } catch (e: any) {
     serviceMessage.value = `${e}`;
-    showSnack(`Install failed: ${e}`, "error");
+    showSnack(t("installFailed", { error: String(e) }), "error");
   } finally {
     serviceLoading.value = false;
   }
@@ -306,7 +371,7 @@ async function doUninstallService() {
     showSnack(msg, "success");
   } catch (e: any) {
     serviceMessage.value = `${e}`;
-    showSnack(`Uninstall failed: ${e}`, "error");
+    showSnack(t("uninstallFailed", { error: String(e) }), "error");
   } finally {
     serviceLoading.value = false;
   }
@@ -319,7 +384,7 @@ async function doStartService() {
     await refreshServiceStatus();
     showSnack(msg, "success");
   } catch (e: any) {
-    showSnack(`Start failed: ${e}`, "error");
+    showSnack(t("startFailed", { error: String(e) }), "error");
   } finally {
     serviceLoading.value = false;
   }
@@ -332,7 +397,7 @@ async function doStopService() {
     await refreshServiceStatus();
     showSnack(msg, "success");
   } catch (e: any) {
-    showSnack(`Stop failed: ${e}`, "error");
+    showSnack(t("stopFailed", { error: String(e) }), "error");
   } finally {
     serviceLoading.value = false;
   }
@@ -345,9 +410,17 @@ async function doStopService() {
     <v-app-bar flat color="surface" elevation="1">
       <v-icon icon="mdi-cpu-64-bit" class="ml-4 mr-2" color="primary" />
       <v-app-bar-title class="text-h6">
-        CPU Manager
+        {{ t('appTitle') }}
       </v-app-bar-title>
       <v-spacer />
+      <v-btn size="small" variant="text" prepend-icon="mdi-translate" @click="toggleLocale">{{ t('language') }}</v-btn>
+
+      <!-- Theme toggle -->
+      <v-tooltip :text="themeTooltip" location="bottom">
+        <template #activator="{ props }">
+          <v-btn v-bind="props" :icon="themeIcon" variant="text" class="mr-2" @click="toggleTheme" />
+        </template>
+      </v-tooltip>
 
       <!-- CPU Info Bar -->
       <div class="cpu-info-bar d-none d-md-flex align-center mr-4" @contextmenu.prevent="openCpuInfoContextMenu">
@@ -355,13 +428,11 @@ async function doStopService() {
           <v-icon icon="mdi-memory" start />
           {{ topology?.total_logical_processors ?? "-" }} LP
         </v-chip>
-        <v-chip v-if="topology" size="small" variant="outlined" class="mr-2">
-          {{ topology.cores.length }} cores / {{ topology.dies.length }}
-          <v-chip v-if="topology.dies.length > 1" size="x-small" color="success" class="ml-1">CCD</v-chip>
-          <v-chip v-else size="small" variant="tonal">
-            <v-icon icon="mdi-view-module" start />
-            CCD
-          </v-chip>
+        <v-chip v-if="topology" size="small" variant="outlined" :color="isMultiDie ? 'success' : undefined" class="mr-2">
+          {{ topology.cores.length }} {{ t('cores') }} / {{ topology.dies.length }}
+          <span v-if="topology.dies.length > 0" class="ml-2 text-caption font-weight-bold text-uppercase" :class="isMultiDie ? 'text-success' : ''">
+            {{ dieGroupLabel }}
+          </span>
         </v-chip>
       </div>
 
@@ -373,15 +444,22 @@ async function doStopService() {
         </template>
       </v-tooltip>
 
-      <!-- 亲和性规则 -->
-      <v-tooltip text="亲和性规则" location="bottom">
+      <!-- Affinity rules -->
+      <v-tooltip :text="t('rules')" location="bottom">
         <template #activator="{ props }">
-          <v-btn v-bind="props" icon="mdi-ruler" variant="text" color="info" @click="ruleManagerOpen = true" />
+          <v-btn v-bind="props" icon="mdi-bullseye" variant="text" color="info" @click="ruleManagerOpen = true" />
+        </template>
+      </v-tooltip>
+
+      <!-- Dynamic optimization (ProBalance) -->
+      <v-tooltip :text="t('pb')" location="bottom">
+        <template #activator="{ props }">
+          <v-btn v-bind="props" icon="mdi-tune-vertical" variant="text" color="purple-accent-2" @click="pbPanelOpen = true" />
         </template>
       </v-tooltip>
 
       <!-- Service Management -->
-      <v-tooltip text="开机自启服务" location="bottom">
+      <v-tooltip :text="t('service')" location="bottom">
         <template #activator="{ props }">
           <v-btn v-bind="props" icon="mdi-server-network" variant="text"
             :color="serviceStatus === 'running' ? 'success' : serviceStatus === 'not_installed' ? undefined : 'warning'"
@@ -389,12 +467,6 @@ async function doStopService() {
         </template>
       </v-tooltip>
 
-      <!-- Refresh -->
-      <v-tooltip text="Refresh (Full Reload)" location="bottom">
-        <template #activator="{ props }">
-          <v-btn v-bind="props" icon="mdi-refresh" variant="text" :loading="loading" @click="refreshFull" />
-        </template>
-      </v-tooltip>
     </v-app-bar>
 
     <v-main>
@@ -403,60 +475,70 @@ async function doStopService() {
         <v-row dense class="mb-2 align-center">
           <v-col cols="12" sm="6" md="4">
             <v-text-field v-model="search" prepend-inner-icon="mdi-magnify"
-              placeholder="Search process name or PID..." density="compact" variant="outlined" hide-details clearable />
+              :placeholder="t('search')" density="compact" variant="outlined" hide-details clearable />
           </v-col>
           <v-col cols="auto">
-            <span class="text-body-2 text-medium-emphasis">Processes <strong>{{ processCount }}</strong></span>
+            <span class="text-body-2 text-medium-emphasis">{{ t('processes') }} <strong>{{ processCount }}</strong></span>
           </v-col>
           <v-spacer />
           <v-col cols="auto">
             <!-- View mode toggle -->
-            <v-tooltip text="切换: 平坦列表" location="bottom">
+            <v-tooltip :text="t('switchToFlat')" location="bottom">
               <template #activator="{ props }">
                 <v-btn v-bind="props" size="small" variant="tonal"
                   :color="viewMode === 'flat' ? 'primary' : undefined"
                   prepend-icon="mdi-format-list-bulleted-square" @click="viewMode = 'flat'" class="mr-1">
-                  Flat
+                  {{ t('flat') }}
                 </v-btn>
               </template>
             </v-tooltip>
-            <v-tooltip text="切换: 进程树" location="bottom">
+            <v-tooltip :text="t('switchToTree')" location="bottom">
               <template #activator="{ props }">
                 <v-btn v-bind="props" size="small" variant="tonal"
                   :color="viewMode === 'tree' ? 'primary' : undefined"
                   prepend-icon="mdi-family-tree" @click="viewMode = 'tree'" class="mr-2">
-                  Tree
+                  {{ t('tree') }}
                 </v-btn>
               </template>
             </v-tooltip>
             <!-- Pause/Resume -->
-            <v-tooltip :text="streaming ? '暂停指标' : '继续指标'" location="bottom">
+            <v-tooltip :text="streaming ? t('pauseMetrics') : t('resumeMetrics')" location="bottom">
               <template #activator="{ props }">
                 <v-btn v-bind="props" size="small" variant="tonal"
                   :color="streaming ? 'primary' : 'warning'"
                   :prepend-icon="streaming ? 'mdi-pause' : 'mdi-play'"
                   :disabled="toggleStreamingBusy" @click="toggleStreaming">
-                  {{ streaming ? "Pause" : "Resume" }}
+                  {{ streaming ? t('pause') : t('resume') }}
                 </v-btn>
               </template>
             </v-tooltip>
           </v-col>
         </v-row>
 
-        <v-alert v-if="false" type="error" density="compact" class="mb-3" closable />
-
         <!-- Loading bar -->
         <v-progress-linear v-if="loading && !processes.length" indeterminate color="primary" class="mb-2" />
+
+        <v-card v-if="logicalProcessorUsage.length" variant="outlined" class="mb-2 pa-2">
+          <div class="text-caption text-medium-emphasis mb-1">{{ t('cpu') }}</div>
+          <div class="d-flex flex-wrap ga-2">
+            <div v-for="usage in logicalProcessorUsage" :key="usage.index" class="core-usage">
+              <span>{{ usage.index }}</span>
+              <v-progress-linear :model-value="usage.usage_percent" height="5" rounded color="primary" />
+            </div>
+          </div>
+        </v-card>
 
         <!-- Process Table -->
         <div ref="tableCardRef">
           <v-card variant="outlined">
             <v-data-table :items="tableRows" :headers="[
               { title: 'PID', key: 'pid', sortable: true, width: '70px', minWidth: '70px' },
-              { title: viewMode === 'tree' ? 'Name (Tree)' : 'Name', key: 'name', sortable: true, width: '200px', minWidth: '150px' },
-              { title: 'CPU', key: 'cpu_usage_percent', sortable: true, width: '80px', minWidth: '80px', align: 'end' },
-              { title: 'Memory', key: 'memory_bytes', sortable: true, width: '100px', minWidth: '100px', align: 'end' },
-              { title: 'Affinity', key: 'affinity', sortable: false, width: '100px', minWidth: '100px' },
+              { title: viewMode === 'tree' ? t('nameTree') : t('name'), key: 'name', sortable: true, width: '200px', minWidth: '150px' },
+              { title: t('cpu'), key: 'cpu_usage_percent', sortable: true, width: '80px', minWidth: '80px', align: 'end' },
+              { title: 'CPU', key: 'cpu_history', sortable: false, width: '70px', minWidth: '70px', align: 'center' },
+              { title: t('memory'), key: 'memory_bytes', sortable: true, width: '100px', minWidth: '100px', align: 'end' },
+              { title: t('priority'), key: 'priority_class', sortable: true, width: '110px', minWidth: '110px' },
+              { title: t('affinity'), key: 'affinity', sortable: false, width: '150px', minWidth: '140px' },
             ]"  :height="tableHeight" fixed-header density="compact" hover
               :header-props="{ class: 'font-weight-bold' }" item-value="pid"
               :row-props="rowProps" v-model:sort-by="sortBy"
@@ -477,7 +559,11 @@ async function doStopService() {
                     <v-icon v-else size="small" class="mr-1" icon="mdi-minus" color="grey-lighten-1" />
                   </template>
                   <v-icon size="small" class="mr-2" :icon="item.name.endsWith('.exe') ? 'mdi-application' : 'mdi-cog'" color="grey" />
-                  <span class="text-body-2">{{ item.name }}</span>
+                  <v-tooltip :text="item.exe_path ?? ''" location="top" :disabled="!item.exe_path">
+                    <template #activator="{ props }">
+                      <span class="text-body-2" v-bind="props">{{ item.name }}</span>
+                    </template>
+                  </v-tooltip>
                   <v-chip v-if="viewMode === 'tree' && (item as any)._hasChildren" size="x-small" variant="tonal" class="ml-2">
                     {{ countChildren(processes, item.pid) }}
                   </v-chip>
@@ -491,23 +577,40 @@ async function doStopService() {
                 </span>
               </template>
 
+              <template #item.cpu_history="{ item }">
+                <svg v-if="cpuSparkline(item.pid)" width="60" height="20" viewBox="0 0 60 20" role="img" :aria-label="t('cpu')">
+                  <polyline :points="cpuSparkline(item.pid)" fill="none" :stroke="item._display.cpu_color" stroke-width="1.5" />
+                </svg>
+                <span v-else class="text-medium-emphasis">-</span>
+              </template>
+
               <!-- Memory -->
               <template #item.memory_bytes="{ item }">
                 <span v-if="item.memory_bytes > 0" class="text-body-2">{{ item._display.mem_text }}</span>
                 <span v-else class="text-medium-emphasis">-</span>
               </template>
 
+              <!-- Priority -->
+              <template #item.priority_class="{ item }">
+                <span class="text-body-2" :style="prioStyle(item)" :title="priorityTooltip(item)">
+                  {{ priorityClassLabel(item.priority_class) }}
+                </span>
+              </template>
+
               <!-- Affinity -->
               <template #item.affinity="{ item }">
                 <div v-if="item.access_denied" class="text-medium-emphasis text-body-2">
-                  <v-icon icon="mdi-lock" size="small" class="mr-1" />权限不足
+                  <v-icon icon="mdi-lock" size="small" class="mr-1" />{{ t('accessDenied') }}
                 </div>
                 <div v-else-if="!item.affinity_mask" class="text-medium-emphasis text-body-2">-</div>
                 <div v-else class="d-flex align-center">
-                  <div class="d-flex ga-1">
+                  <div class="d-flex ga-1 flex-wrap">
                     <div v-for="bar in item._display.ccd_bars" :key="bar.id" class="affinity-bar"
-                      :title="`CCD ${bar.id}: Enabled: ${bar.enabled} / ${bar.total}  threads`"
-                      :style="{ background: bar.enabled > 0 ? bar.color : 'transparent', borderColor: bar.color }">
+                      :class="{ 'affinity-bar--empty': bar.enabled === 0 }"
+                      role="img"
+                      :aria-label="t('ccdBarTitle', { id: bar.id, enabled: bar.enabled, total: bar.total })"
+                      :title="t('ccdBarTitle', { id: bar.id, enabled: bar.enabled, total: bar.total })"
+                      :style="{ background: bar.enabled > 0 ? bar.color : 'transparent', borderColor: bar.enabled > 0 ? bar.color : undefined }">
                       {{ bar.enabled }}
                     </div>
                   </div>
@@ -518,7 +621,7 @@ async function doStopService() {
               <template #no-data>
                 <div class="text-center pa-6 text-medium-emphasis">
                   <v-icon icon="mdi-database-off-outline" size="large" class="mb-2" />
-                  <div>无进程数据</div>
+                  <div>{{ t('noData') }}</div>
                 </div>
               </template>
             </v-data-table>
@@ -533,12 +636,15 @@ async function doStopService() {
     <!-- Affinity Rule Manager Dialog -->
     <AffinityRuleManager v-model="ruleManagerOpen" :topology="topology" @applied="onRulesApplied" />
 
+    <!-- ProBalance Dynamic Optimization Panel -->
+    <ProBalancePanel v-model="pbPanelOpen" />
+
     <!-- Service Management Dialog -->
     <v-dialog v-model="serviceDialogOpen" max-width="520" scroll-strategy="block">
       <v-card>
         <v-card-title class="d-flex align-center pa-3">
           <v-icon icon="mdi-server-network" class="mr-2" :color="serviceStatus === 'running' ? 'success' : 'warning'" />
-          <span class="text-h6">开机自启服务</span>
+          <span class="text-h6">{{ t('service') }}</span>
           <v-spacer />
           <v-btn icon="mdi-close" variant="text" density="compact" @click="serviceDialogOpen = false" />
         </v-card-title>
@@ -550,8 +656,7 @@ async function doStopService() {
             :text="serviceStatusText" />
 
           <p class="text-body-2 text-medium-emphasis mb-4">
-            安装后，CPU 亲和性规则会在开机时自动应用到匹配的进程。
-            服务以 SYSTEM 身份运行，每 5 秒扫描一次。
+            {{ t('serviceDesc') }}
           </p>
 
           <v-alert v-if="serviceMessage" type="info" density="compact" variant="outlined" class="mb-3" closable
@@ -564,27 +669,27 @@ async function doStopService() {
           <v-btn v-if="serviceStatus === 'not_installed'"
             color="primary" variant="flat" prepend-icon="mdi-download"
             :loading="serviceLoading" @click="doInstallService">
-            安装并启动
+            {{ t('installAndStart') }}
           </v-btn>
           <template v-else>
             <v-btn v-if="serviceStatus === 'running'"
               color="warning" variant="tonal" prepend-icon="mdi-stop"
               :loading="serviceLoading" @click="doStopService">
-              Stop
+              {{ t('stop') }}
             </v-btn>
             <v-btn v-else
               color="success" variant="tonal" prepend-icon="mdi-play"
               :loading="serviceLoading" @click="doStartService">
-              Start
+              {{ t('start') }}
             </v-btn>
             <v-btn color="error" variant="tonal" prepend-icon="mdi-delete"
               :loading="serviceLoading" @click="doUninstallService">
-              Uninstall
+              {{ t('uninstall') }}
             </v-btn>
           </template>
           <v-spacer />
           <v-btn variant="text" prepend-icon="mdi-refresh" :loading="serviceLoading" @click="refreshServiceStatus">
-            刷新状态
+            {{ t('refreshStatus') }}
           </v-btn>
         </v-card-actions>
       </v-card>
@@ -607,35 +712,38 @@ async function doStopService() {
           <template v-if="ctxMenu.type === 'processRow' && ctxMenu.process">
             <v-list-item prepend-icon="mdi-pencil" base-color="primary"
               :disabled="ctxMenu.process.access_denied || !ctxMenu.process.affinity_mask" @click="ctxEdit">
-              <v-list-item-title>Edit Affinity</v-list-item-title>
+              <v-list-item-title>{{ t('editRules') }}</v-list-item-title>
             </v-list-item>
             <v-list-item prepend-icon="mdi-undo-variant"
               :disabled="ctxMenu.process.access_denied || !ctxMenu.process.system_affinity_mask" @click="ctxReset">
-              <v-list-item-title>Reset to Default</v-list-item-title>
+              <v-list-item-title>{{ t('resetDefault') }}</v-list-item-title>
             </v-list-item>
             <v-divider class="my-1" />
             <v-list-item prepend-icon="mdi-content-copy" @click="ctxCopy('pid')">
-              <v-list-item-title>Copy PID</v-list-item-title>
+              <v-list-item-title>{{ t('copyPid') }}</v-list-item-title>
             </v-list-item>
             <v-list-item prepend-icon="mdi-content-copy" @click="ctxCopy('name')">
-              <v-list-item-title>复制进程名</v-list-item-title>
+              <v-list-item-title>{{ t('copyName') }}</v-list-item-title>
+            </v-list-item>
+            <v-list-item prepend-icon="mdi-content-copy" @click="ctxCopy('path')">
+              <v-list-item-title>{{ t('copyPath') }}</v-list-item-title>
             </v-list-item>
             <v-list-item prepend-icon="mdi-content-copy" :disabled="!ctxMenu.process.affinity_mask" @click="ctxCopy('mask')">
-              <v-list-item-title>复制亲和性掩码</v-list-item-title>
+              <v-list-item-title>{{ t('copyMask') }}</v-list-item-title>
             </v-list-item>
             <v-divider class="my-1" />
             <v-list-item prepend-icon="mdi-clipboard-text-outline" @click="ctxCopy('all')">
-              <v-list-item-title>复制全部 Info</v-list-item-title>
+              <v-list-item-title>{{ t('copyAll') }}</v-list-item-title>
             </v-list-item>
           </template>
 
           <!-- CPU Info Menu -->
           <template v-else-if="ctxMenu.type === 'cpuInfo'">
             <v-list-item prepend-icon="mdi-content-copy" @click="ctxCopyCpuInfo">
-              <v-list-item-title>复制 CPU 信息</v-list-item-title>
+              <v-list-item-title>{{ t('copyCpu') }}</v-list-item-title>
             </v-list-item>
             <v-list-item prepend-icon="mdi-refresh" @click="ctxRefreshTopology">
-              <v-list-item-title>Refresh Topology</v-list-item-title>
+              <v-list-item-title>{{ t('refreshTopology') }}</v-list-item-title>
             </v-list-item>
           </template>
         </v-list>
@@ -673,6 +781,11 @@ html, body {
   text-overflow: ellipsis !important;
   white-space: nowrap !important;
 }
+
+.core-usage {
+  width: 54px;
+  font-size: 11px;
+}
 .ctx-menu {
   position: fixed;
   border-radius: 6px;
@@ -685,22 +798,52 @@ html, body {
   from { opacity: 0; transform: scale(0.96); }
   to { opacity: 1; transform: scale(1); }
 }
+
+/* ---------- Dark theme: soften the pure-white outlined-component border ----------
+ * Vuetify's outlined components default to `border: currentColor`, which in dark
+ * mode resolves to pure white (on-surface) and is visually too harsh. Swap to
+ * a neutral gray, while keeping Vuetify's own hover/focus/error state logic. */
+.v-theme--dark {
+  --cpum-outline: rgba(148, 148, 148, 0.38);
+}
+.v-theme--dark .v-btn--variant-outlined,
+.v-theme--dark .v-chip--variant-outlined,
+.v-theme--dark .v-card--variant-outlined,
+.v-theme--dark .v-alert--variant-outlined {
+  border-color: var(--cpum-outline);
+}
+/* Input field outline: use a solid neutral gray, and let --v-field-border-opacity
+ * own the transparency (hover/focus brighten it). Excludes the error state so
+ * the red error border is preserved. */
+.v-theme--dark .v-field--variant-outlined:not(.v-field--error) .v-field__outline__start,
+.v-theme--dark .v-field--variant-outlined:not(.v-field--error) .v-field__outline__notch::before,
+.v-theme--dark .v-field--variant-outlined:not(.v-field--error) .v-field__outline__notch::after,
+.v-theme--dark .v-field--variant-outlined:not(.v-field--error) .v-field__outline__end {
+  border-color: rgb(148, 148, 148);
+}
 </style>
 
 <style scoped>
 .affinity-bar {
-  width: 28px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1.5px solid;
+  border: 1px solid;
   border-radius: 4px;
   font-size: 11px;
   font-weight: 600;
   color: #fff;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
   cursor: help;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.affinity-bar--empty {
+  border-color: rgba(128, 128, 128, 0.28);
+  color: rgba(128, 128, 128, 0.75);
+  text-shadow: none;
 }
 .cpu-info-bar :deep(.v-chip) {
   font-weight: 500;

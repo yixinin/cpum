@@ -5,11 +5,21 @@
     <link rel="icon" type="image/png" href="/src/assets/icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CPU Manager</title>
+    <script>
+      // Skeleton screen follows the saved theme (use the light placeholder when
+      // cpum-theme=light, to avoid a black flash on a light-themed load)
+      try {
+        if (localStorage.getItem("cpum-theme") === "light") {
+          document.documentElement.classList.add("sk-light");
+        }
+      } catch (e) {}
+    </script>
     <style>
-      /* 只保留最外层壳占位 (AppBar + 工具栏空壳 + 一个空矩形),
-       * 绝不画假的表格行/列 —— 真正的占位行由 Vuetify v-data-table 内建
-       * loading 行在「表内部」完成, 避免「假页面 → 空真表 → 填数据」三段跳变。
-       */
+      /* Only keep the outermost shell as a placeholder (AppBar + toolbar shells
+       * + one empty rectangle). Never draw fake table rows/columns here — the
+       * real placeholder rows are produced by Vuetify v-data-table's built-in
+       * loading state inside the table, which avoids a three-stage flicker of
+       * "fake page → empty real table → filled data". */
       html, body { margin: 0; padding: 0; height: 100%; background: #1e1e1e; color: #e9ecf1;
         font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
       #app-skeleton { position: fixed; inset: 0; z-index: 1; background: #1e1e1e; display: flex; flex-direction: column; }
@@ -38,8 +48,22 @@
       .sk-btn-outline { width: 120px; height: 36px; background: #2a2a2b; border-radius: 6px; }
       .sk-btn-bug { width: 40px; height: 36px; background: #2a2a2b; border-radius: 6px; }
 
-      /* 表格区域: 只是一个空矩形, 不画假行 —— 等 Vuetify 自己接管 */
+      /* Table area: just an empty rectangle, no fake rows — let Vuetify take over */
       .sk-table-area { flex: 1; background: #1e1e1e; }
+
+      /* ---------- Light theme skeleton (html.sk-light, applied by the head script
+         based on the saved cpum-theme) ---------- */
+      html.sk-light #app-skeleton { background: #f4f5f7; }
+      html.sk-light .sk-bar { background: #ffffff; border-bottom-color: #e0e0e0; }
+      html.sk-light .sk-bar-title { color: #1e1e1e; }
+      html.sk-light .sk-bar-icon,
+      html.sk-light .sk-bar-chip, html.sk-light .sk-bar-chip-2, html.sk-light .sk-bar-chip-3,
+      html.sk-light .sk-search, html.sk-light .sk-toggle, html.sk-light .sk-toggle-2,
+      html.sk-light .sk-btn, html.sk-light .sk-btn-slim, html.sk-light .sk-btn-outline, html.sk-light .sk-btn-bug {
+        background: #e4e6ea;
+      }
+      html.sk-light .sk-toolbar { background: #f4f5f7; border-bottom-color: #e6e6e6; }
+      html.sk-light .sk-table-area { background: #f4f5f7; }
     </style>
   </head>
   <body>
@@ -66,8 +90,9 @@
     </div>
     <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>
-    <!-- 后备: 如果 main.ts 因任何原因 (模块加载失败/运行时错误) 没执行到 finally,
-         3 秒后强制移除骨架屏, 避免用户永远看到 mock UI -->
+    <!-- Fallback: if main.ts fails to reach its finally block for any reason
+         (module load failure / runtime error), forcibly remove the skeleton
+         after 3s so the user is never stuck on the mock UI -->
     <script>
       setTimeout(function () {
         var s = document.getElementById("app-skeleton");

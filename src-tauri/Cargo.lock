@@ -547,6 +547,7 @@ dependencies = [
 name = "cpum"
 version = "0.1.0"
 dependencies = [
+ "cpum-core",
  "once_cell",
  "serde",
  "serde_json",
@@ -557,6 +558,17 @@ dependencies = [
  "windows 0.62.2",
  "windows-service",
  "winres",
+]
+
+[[package]]
+name = "cpum-core"
+version = "0.1.0"
+dependencies = [
+ "once_cell",
+ "serde",
+ "serde_json",
+ "uuid",
+ "windows 0.62.2",
 ]
 
 [[package]]

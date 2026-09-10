@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, watch } from "vue";
-import type { CpuTopology, ProcessInfo, LogicalProcessorInfo } from "../types";
-import { parseMask, formatMask, popcount, getBit, setBit } from "../types";
-import { setProcessAffinity, loadAffinityRules, addAffinityRule, updateAffinityRule } from "../api";
+import type { CpuTopology, ProcessInfo, LogicalProcessorInfo, RuleMode } from "../types";
+import { parseMask, formatMask, popcount, getBit, setBit, PRIORITY_CLASS_OPTIONS, IO_PRIORITY_OPTIONS, MEMORY_PRIORITY_OPTIONS } from "../types";
+import type { AffinityRule } from "../api";
+import { setProcessAffinity, setProcessPriority, loadAffinityRules, addAffinityRule, updateAffinityRule } from "../api";
+import { useI18n } from "../i18n";
+const { t } = useI18n();
 
 const props = defineProps<{
   modelValue: boolean;
@@ -15,30 +18,80 @@ const emit = defineEmits<{
   applied: [];
 }>();
 
-// 当前编辑的 mask (bigint)
+// The mask currently being edited (bigint)
 const editingMask = ref<bigint>(0n);
-// 原始 mask (用于 Reset)
+// The original mask (used for Reset)
 const originalMask = ref<bigint>(0n);
-// 系统 mask (限制可选项)
+// The system mask (restricts which LPs are selectable)
 const systemMask = ref<bigint>(0n);
 const applying = ref(false);
 const errorMsg = ref<string | null>(null);
 
-// 当 dialog 打开 / 进程变化时, 初始化
+// ---------- Priority edit state (M1) ----------
+const editingPrioClass = ref<number | null>(null);
+const editingIo = ref<number | null>(null);
+const editingMem = ref<number | null>(null);
+const originalPrioClass = ref<number | null>(null);
+const originalIo = ref<number | null>(null);
+const originalMem = ref<number | null>(null);
+
+// ---------- Scheduling mode + save as rule (M1/M2) ----------
+/** strict = hard mask pins cores; soft = elastic CPU Sets (auto-falls back to hard mask on older systems) */
+const affinityMode = ref<RuleMode>("strict");
+/** Only persisted when the user explicitly checks "Save as rule" — replaces the old silent-save behavior */
+const saveAsRule = ref(false);
+
+// Initialize when the dialog opens / the process changes
 watch(
   () => [props.modelValue, props.process],
   () => {
     if (props.modelValue && props.process) {
-      originalMask.value = parseMask(props.process.affinity_mask);
+      originalMask.value = props.process.group_affinity_masks
+        ? props.process.group_affinity_masks.reduce((all, value, group) => all | (parseMask(value) << BigInt(group * 64)), 0n)
+        : parseMask(props.process.affinity_mask);
       editingMask.value = originalMask.value;
-      systemMask.value = parseMask(props.process.system_affinity_mask);
+      systemMask.value = props.process.group_system_affinity_masks
+        ? props.process.group_system_affinity_masks.reduce((all, value, group) => all | (parseMask(value) << BigInt(group * 64)), 0n)
+        : parseMask(props.process.system_affinity_mask);
+      originalPrioClass.value = props.process.priority_class;
+      editingPrioClass.value = props.process.priority_class;
+      originalIo.value = props.process.io_priority;
+      editingIo.value = props.process.io_priority;
+      originalMem.value = props.process.memory_priority;
+      editingMem.value = props.process.memory_priority;
+      affinityMode.value = "strict";
+      saveAsRule.value = false;
       errorMsg.value = null;
     }
   },
   { immediate: true }
 );
 
-// LP index -> LogicalProcessorInfo 查找表
+// Dropdown options (computed to stay reactive to locale changes)
+const prioClassItems = computed(() =>
+  PRIORITY_CLASS_OPTIONS.map((o) => ({ title: t(o.labelKey), value: o.value })),
+);
+const ioPriorityItems = computed(() =>
+  IO_PRIORITY_OPTIONS.map((o) => ({ title: t(o.labelKey), value: o.value })),
+);
+const memPriorityItems = computed(() =>
+  MEMORY_PRIORITY_OPTIONS.map((o) => ({ title: t(o.labelKey), value: o.value })),
+);
+
+const priorityDirty = computed(
+  () =>
+    editingPrioClass.value !== originalPrioClass.value ||
+    editingIo.value !== originalIo.value ||
+    editingMem.value !== originalMem.value,
+);
+
+function resetPriorities() {
+  editingPrioClass.value = originalPrioClass.value;
+  editingIo.value = originalIo.value;
+  editingMem.value = originalMem.value;
+}
+
+// LP index -> LogicalProcessorInfo lookup table
 const lpMap = computed(() => {
   const m = new Map<number, LogicalProcessorInfo>();
   if (props.topology) {
@@ -47,7 +100,7 @@ const lpMap = computed(() => {
   return m;
 });
 
-// 按 CCD 分组的逻辑处理器列表 (用于渲染)
+// LPs grouped by die/CCD (for rendering)
 const diesWithLps = computed(() => {
   if (!props.topology) return [];
   return props.topology.dies.map((die) => ({
@@ -62,17 +115,23 @@ const diesWithLps = computed(() => {
 const selectedCount = computed(() => popcount(editingMask.value));
 const totalCount = computed(() => props.topology?.total_logical_processors ?? 0);
 const maskHex = computed(() => formatMask(editingMask.value));
+const groupMaskStrings = computed(() => {
+  const count = props.topology?.group_count ?? 1;
+  return Array.from({ length: count }, (_, group) =>
+    formatMask((editingMask.value >> BigInt(group * 64)) & ((1n << 64n) - 1n)),
+  );
+});
 
-// CCD 颜色调色板 (最多 8 个 CCD, 颜色高对比度)
+// CCD color palette (up to 8 CCDs, high-contrast colors)
 const CCD_COLORS = [
-  "#42A5F5", // 蓝
-  "#66BB6A", // 绿
-  "#FFA726", // 橙
-  "#EF5350", // 红
-  "#AB47BC", // 紫
-  "#26C6DA", // 青
-  "#FFEE58", // 黄
-  "#8D6E63", // 棕
+  "#42A5F5", // blue
+  "#66BB6A", // green
+  "#FFA726", // orange
+  "#EF5350", // red
+  "#AB47BC", // purple
+  "#26C6DA", // cyan
+  "#FFEE58", // yellow
+  "#8D6E63", // brown
 ];
 
 function ccdColor(dieId: number): string {
@@ -90,7 +149,7 @@ function toggleBit(bit: number) {
   editingMask.value = setBit(editingMask.value, bit, !isActive(bit));
 }
 
-// ---------- 快速选择 ----------
+// ---------- Quick select ----------
 
 function selectAll() {
   editingMask.value = systemMask.value;
@@ -142,31 +201,73 @@ function clearCcd(dieId: number) {
 
 async function apply() {
   if (!props.process) return;
+  if (editingMask.value === 0n) {
+    errorMsg.value = t("atLeastOneLp");
+    return;
+  }
   applying.value = true;
   errorMsg.value = null;
+  // Snapshot priority-dirty first (apply() will write back into original*, after which dirty would be false)
+  const prioDirty = priorityDirty.value;
   try {
-    await setProcessAffinity(props.process.pid, editingMask.value);
+    // 1. Apply immediately: write per the scheduling mode (soft = CPU Sets; auto-falls back to hard mask on Win10 pre-1803)
+    await setProcessAffinity(props.process.pid, editingMask.value, affinityMode.value, groupMaskStrings.value);
     originalMask.value = editingMask.value;
-    
-    // Persist the setting even when the mask itself was unchanged.
-    const maskHex = formatMask(editingMask.value);
-    const processName = props.process.name.replace(/\.exe$/i, "");
-    const rules = await loadAffinityRules();
-    const existing = rules.find((rule) =>
-      rule.process_name.replace(/\.exe$/i, "").toLowerCase() === processName.toLowerCase()
-    );
-    if (existing) {
-      await updateAffinityRule(existing.id, { mask: maskHex });
-    } else {
-      await addAffinityRule(processName, maskHex);
+
+    // 2. Priorities: only write the fields the user actually changed
+    if (prioDirty) {
+      await setProcessPriority(props.process.pid, {
+        priorityClass: editingPrioClass.value ?? undefined,
+        ioPriority: editingIo.value ?? undefined,
+        memoryPriority: editingMem.value ?? undefined,
+      });
+      originalPrioClass.value = editingPrioClass.value;
+      originalIo.value = editingIo.value;
+      originalMem.value = editingMem.value;
     }
-    
+
+    // 3. Only persist when "Save as rule" is explicitly checked
+    if (saveAsRule.value) {
+      await persistAsRule(formatMask(editingMask.value), prioDirty);
+    }
+
     emit("applied");
     emit("update:modelValue", false);
   } catch (e) {
     errorMsg.value = e instanceof Error ? e.message : String(e);
   } finally {
     applying.value = false;
+  }
+}
+
+/**
+ * Persist these settings as an "exact match" rule (new, or update an existing rule with the same name).
+ * Priorities are only written when the user actually changed them — untouched fields
+ * keep the rule's existing values, so a casual "tweak once" doesn't bake managed-priority
+ * items into the auto-applied rule.
+ */
+async function persistAsRule(maskHex: string, includePriorities: boolean) {
+  if (!props.process) return;
+  const processName = props.process.name.replace(/\.exe$/i, "");
+  const prio = includePriorities
+    ? {
+        priorityClass: editingPrioClass.value,
+        ioPriority: editingIo.value,
+        memoryPriority: editingMem.value,
+      }
+    : {};
+
+  const rules = await loadAffinityRules();
+  const normalize = (s: string) => s.replace(/\.exe$/i, "").toLowerCase();
+  const existing: AffinityRule | undefined = rules.find(
+    (r) => r.match_type === "exact" && normalize(r.process_name) === normalize(processName),
+  );
+
+  if (existing) {
+    // Whole-record replacement: keep the existing rule's id / note / enabled state; only update mask / mode (+ any changed priorities)
+    await updateAffinityRule({ ...existing, mask: maskHex, group_masks: groupMaskStrings.value, mode: affinityMode.value, ...prio });
+  } else {
+    await addAffinityRule({ processName, mask: maskHex, groupMasks: groupMaskStrings.value, mode: affinityMode.value, ...prio });
   }
 }
 
@@ -185,8 +286,8 @@ function close() {
   >
     <v-card v-if="process">
       <v-card-title class="d-flex align-center pa-3">
-        <v-icon icon="mdi-chip" class="mr-2" />
-        <span class="text-h6">CPU 亲和性 - {{ process.name }}</span>
+        <v-icon icon="mdi-bullseye" class="mr-2" />
+        <span class="text-h6">{{ t('editRules') }} - {{ process.name }}</span>
         <v-chip size="small" color="primary" variant="tonal" class="ml-2">PID {{ process.pid }}</v-chip>
         <v-spacer />
         <v-btn icon="mdi-close" variant="text" density="compact" @click="close" />
@@ -195,14 +296,14 @@ function close() {
       <v-divider />
 
       <v-card-text class="pa-4">
-        <!-- 快速选择工具栏 -->
+        <!-- Quick-select toolbar -->
         <div class="d-flex align-center flex-wrap mb-3">
-          <span class="text-subtitle-2 mr-2">快速选择:</span>
-          <v-btn size="small" variant="outlined" class="mr-2 mb-1" @click="selectAll">全部</v-btn>
-          <v-btn size="small" variant="outlined" class="mr-2 mb-1" @click="selectNone">清空</v-btn>
-          <v-btn size="small" variant="outlined" class="mr-2 mb-1" @click="selectPrimary">仅主线程</v-btn>
-          <v-btn size="small" variant="outlined" class="mr-2 mb-1" @click="selectSecondary">仅副线程</v-btn>
-          <v-btn size="small" variant="outlined" class="mb-1" @click="resetMask">重置到原值</v-btn>
+          <span class="text-subtitle-2 mr-2">{{ t('quickSelect') }}</span>
+          <v-btn size="small" variant="outlined" class="mr-2 mb-1" @click="selectAll">{{ t('all') }}</v-btn>
+          <v-btn size="small" variant="outlined" class="mr-2 mb-1" @click="selectNone">{{ t('clear') }}</v-btn>
+          <v-btn size="small" variant="outlined" class="mr-2 mb-1" @click="selectPrimary">{{ t('primary') }}</v-btn>
+          <v-btn size="small" variant="outlined" class="mr-2 mb-1" @click="selectSecondary">{{ t('secondary') }}</v-btn>
+          <v-btn size="small" variant="outlined" class="mb-1" @click="resetMask">{{ t('reset') }}</v-btn>
         </div>
 
         <v-alert v-if="errorMsg" type="error" density="compact" class="mb-3" closable @click:close="errorMsg = null">
@@ -215,12 +316,12 @@ function close() {
           density="compact"
           class="mb-3"
         >
-          当前系统存在多个处理器组, 仅支持编辑默认组的亲和性。
+          {{ t('multiGroupWarn') }}
         </v-alert>
 
-        <!-- CCD 分组渲染 -->
+        <!-- CCD-grouped rendering -->
         <div v-if="!topology" class="text-center text-medium-emphasis pa-4">
-          正在加载 CPU 拓扑...
+          {{ t('loadingTopology') }}
         </div>
 
         <div v-for="{ die, lps } in diesWithLps" :key="die.id" class="ccd-section mb-4">
@@ -230,10 +331,10 @@ function close() {
               :style="{ background: ccdColor(die.id) }"
             />
             <span class="text-subtitle-2">
-              {{ die.is_ccd ? `CCD ${die.id}` : `逻辑 Die ${die.id}` }}
+              {{ die.is_ccd ? `CCD ${die.id}` : t('logicalDie', { id: die.id }) }}
             </span>
             <span class="text-caption text-medium-emphasis ml-2">
-              {{ die.cores.length }} 物理核 / {{ die.threads.length }} 逻辑线程
+              {{ t('dieInfo', { cores: die.cores.length, threads: die.threads.length }) }}
             </span>
             <v-spacer />
             <v-btn
@@ -243,9 +344,9 @@ function close() {
               :style="{ color: ccdColor(die.id) }"
               @click="selectCcd(die.id)"
             >
-              选此 CCD
+              {{ t('selectCcd') }}
             </v-btn>
-            <v-btn size="x-small" variant="text" @click="clearCcd(die.id)">清除</v-btn>
+            <v-btn size="x-small" variant="text" @click="clearCcd(die.id)">{{ t('clearCcd') }}</v-btn>
           </div>
 
           <div class="cpu-grid">
@@ -261,12 +362,92 @@ function close() {
                 unavailable: !isAvailable(lp.index),
               }"
               :style="{ '--ccd': ccdColor(die.id) }"
-              :title="`LP ${lp.index} · Core ${lp.core_id}${lp.is_smt_secondary ? ' (SMT 副线程)' : ' (主线程)'}`"
+              :title="`LP ${lp.index} · Core ${lp.core_id} ${lp.is_smt_secondary ? t('smtSecondaryLabel') : t('smtPrimaryLabel')}`"
               @click="toggleBit(lp.index)"
             >
               {{ lp.index }}
             </button>
           </div>
+        </div>
+
+        <!-- Scheduling mode (M2: strict = hard mask / soft = CPU Sets) -->
+        <div class="d-flex align-center mt-4 mb-2">
+          <v-icon icon="mdi-tune-variant" size="18" class="mr-2" />
+          <span class="text-subtitle-2">{{ t('ruleMode') }}</span>
+        </div>
+        <v-btn-toggle
+          v-model="affinityMode"
+          mandatory
+          density="compact"
+          color="primary"
+          class="mb-1"
+        >
+          <v-btn value="strict">{{ t('modeStrict') }}</v-btn>
+          <v-btn value="soft">{{ t('modeSoft') }}</v-btn>
+        </v-btn-toggle>
+        <div class="text-caption text-medium-emphasis">
+          {{ affinityMode === 'soft' ? t('modeSoftHint') : t('modeStrictHint') }}
+        </div>
+
+        <!-- Priority settings -->
+        <div class="d-flex align-center mt-4 mb-2">
+          <v-icon icon="mdi-speedometer" size="18" class="mr-2" />
+          <span class="text-subtitle-2">{{ t('prioritySettings') }}</span>
+          <v-btn
+            v-if="priorityDirty"
+            size="x-small"
+            variant="text"
+            class="ml-2"
+            @click="resetPriorities"
+          >
+            {{ t('resetPriorities') }}
+          </v-btn>
+        </div>
+        <v-row dense>
+          <v-col cols="12" sm="4">
+            <v-select
+              v-model="editingPrioClass"
+              :items="prioClassItems"
+              :label="t('cpuPriority')"
+              :disabled="process.access_denied"
+              density="compact"
+              variant="outlined"
+              hide-details
+            />
+          </v-col>
+          <v-col cols="12" sm="4">
+            <v-select
+              v-model="editingIo"
+              :items="ioPriorityItems"
+              :label="t('ioPriority')"
+              :disabled="process.access_denied"
+              density="compact"
+              variant="outlined"
+              hide-details
+            />
+          </v-col>
+          <v-col cols="12" sm="4">
+            <v-select
+              v-model="editingMem"
+              :items="memPriorityItems"
+              :label="t('memoryPriority')"
+              :disabled="process.access_denied"
+              density="compact"
+              variant="outlined"
+              hide-details
+            />
+          </v-col>
+        </v-row>
+
+        <!-- Explicit toggle: persist these settings as a rule? -->
+        <div class="mt-4">
+          <v-checkbox
+            v-model="saveAsRule"
+            :label="t('saveAsRule')"
+            density="compact"
+            hide-details
+          />
+          <div class="text-caption text-medium-emphasis">{{ t('saveAsRuleHint') }}</div>
         </div>
       </v-card-text>
 
@@ -274,20 +455,20 @@ function close() {
 
       <v-card-actions class="pa-3">
         <span class="text-body-2 ml-2">
-          已选 <strong class="text-primary">{{ selectedCount }}</strong> / {{ totalCount }} 逻辑处理器
+          {{ t('selectedPrefix') }} <strong class="text-primary">{{ selectedCount }}</strong> / {{ totalCount }} {{ t('logicalProcessors') }}
         </span>
         <span class="text-body-2 text-medium-emphasis ml-4">
           Mask: <code>{{ maskHex }}</code>
         </span>
         <v-spacer />
-        <v-btn variant="text" :disabled="applying" @click="close">取消</v-btn>
+        <v-btn variant="text" :disabled="applying" @click="close">{{ t('cancel') }}</v-btn>
         <v-btn
           color="primary"
           variant="flat"
           :loading="applying"
           @click="apply"
         >
-          应用
+          {{ t('apply') }}
         </v-btn>
       </v-card-actions>
     </v-card>
@@ -297,9 +478,10 @@ function close() {
 <style scoped>
 .ccd-section {
   padding: 8px 12px;
-  background: rgba(255, 255, 255, 0.02);
+  /* Use the on-surface variable for a subtle background/border: white in dark mode, black in light, auto-adapts to both themes */
+  background: rgba(var(--v-theme-on-surface), 0.02);
   border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(var(--v-theme-on-surface), 0.06);
 }
 
 .ccd-dot {
@@ -307,7 +489,7 @@ function close() {
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  border: 1px solid rgba(var(--v-theme-on-surface), 0.2);
 }
 
 .cpu-grid {
@@ -322,7 +504,7 @@ function close() {
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 2px solid var(--ccd);
+  border: 1.5px solid var(--ccd);
   border-radius: 5px;
   background: transparent;
   color: var(--ccd);
@@ -330,12 +512,13 @@ function close() {
   font-weight: 600;
   cursor: pointer;
   user-select: none;
-  transition: background 0.12s ease, color 0.12s ease, transform 0.08s ease;
+  transition: background 0.12s ease, color 0.12s ease, transform 0.08s ease, border-color 0.12s ease;
   font-family: "Cascadia Code", "Consolas", monospace;
 }
 
 .cpu-box:hover:not(.unavailable) {
   background: color-mix(in srgb, var(--ccd) 22%, transparent);
+  border-color: color-mix(in srgb, var(--ccd) 80%, white);
 }
 
 .cpu-box:active:not(.unavailable) {
@@ -345,13 +528,14 @@ function close() {
 .cpu-box.active {
   background: var(--ccd);
   color: #fff;
+  border-color: color-mix(in srgb, var(--ccd) 80%, white);
 }
 
 .cpu-box.active:hover:not(.unavailable) {
   background: color-mix(in srgb, var(--ccd) 80%, white);
 }
 
-/* SMT 副线程: 虚线边框 */
+/* SMT secondary thread: dashed border */
 .cpu-box.smt-secondary {
   border-style: dashed;
 }
@@ -361,10 +545,10 @@ function close() {
 }
 
 .cpu-box.unavailable {
-  opacity: 0.25;
+  opacity: 0.3;
   cursor: not-allowed;
-  border-color: #757575;
-  color: #757575;
+  border-color: rgba(117, 117, 117, 0.55);
+  color: rgba(117, 117, 117, 0.85);
   background: transparent;
 }
 .cpu-box.unavailable:hover {

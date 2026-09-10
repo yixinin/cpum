@@ -16,6 +16,7 @@ import {
   type MetricsWave,
   type ProcessDiff,
   type AffinityUpdated,
+  type PriorityUpdated,
 } from "../api";
 
 /**
@@ -33,6 +34,9 @@ export function useMetricsStream(opts: {
 }) {
   const streaming = ref(true);
   const toggleBusy = ref(false);
+  const historyVersion = ref(0);
+  const cpuHistoryByPid = new Map<number, number[]>();
+  const HISTORY_POINTS = 60;
   let unlisten: (() => void) | null = null;
   const STREAM_INTERVAL_MS = 1000;
 
@@ -47,6 +51,10 @@ export function useMetricsStream(opts: {
           const target = byPid.get(row[0]);
           if (!target) continue;
           target.cpu_usage_percent = row[1];
+          const history = cpuHistoryByPid.get(target.pid) ?? [];
+          history.push(row[1]);
+          if (history.length > HISTORY_POINTS) history.splice(0, history.length - HISTORY_POINTS);
+          cpuHistoryByPid.set(target.pid, history);
           const d = target._display;
           const displayPercent = scaleCpuPercent(row[1], mode, np);
           d.cpu_text = formatCpuPercent(displayPercent);
@@ -100,6 +108,7 @@ export function useMetricsStream(opts: {
         break;
       }
     }
+    if (wave.wave === 1) historyVersion.value += 1;
   }
 
   function applyProcessDiff(diff: ProcessDiff) {
@@ -110,7 +119,10 @@ export function useMetricsStream(opts: {
     if (diff.removed_pids.length) {
       const removeSet = new Set(diff.removed_pids);
       for (let i = procs.length - 1; i >= 0; i--) {
-        if (removeSet.has(procs[i].pid)) procs.splice(i, 1);
+        if (removeSet.has(procs[i].pid)) {
+          cpuHistoryByPid.delete(procs[i].pid);
+          procs.splice(i, 1);
+        }
       }
       changed = true;
     }
@@ -121,22 +133,34 @@ export function useMetricsStream(opts: {
         if (target) {
           const maskChanged = target.affinity_mask !== info.affinity_mask;
           target.name = info.name;
+          target.exe_path = info.exe_path;
           target.affinity_mask = info.affinity_mask;
           target.system_affinity_mask = info.system_affinity_mask;
+          target.group_affinity_masks = info.group_affinity_masks;
+          target.group_system_affinity_masks = info.group_system_affinity_masks;
           target.parent_pid = info.parent_pid;
           target.access_denied = info.access_denied;
           target.memory_bytes = info.memory_bytes;
+          target.priority_class = info.priority_class;
+          target.io_priority = info.io_priority;
+          target.memory_priority = info.memory_priority;
           refreshDisplayCache(target, baseline, { mem: true, mask: maskChanged });
           if (maskChanged) refreshCcdBars(target, topo);
         } else {
           const newItem: ProcessInfo = {
             pid: info.pid,
             name: info.name,
+            exe_path: info.exe_path,
             affinity_mask: info.affinity_mask,
             system_affinity_mask: info.system_affinity_mask,
+            group_affinity_masks: info.group_affinity_masks,
+            group_system_affinity_masks: info.group_system_affinity_masks,
             parent_pid: info.parent_pid,
             access_denied: info.access_denied,
             memory_bytes: info.memory_bytes,
+            priority_class: info.priority_class,
+            io_priority: info.io_priority,
+            memory_priority: info.memory_priority,
             cpu_usage_percent: 0,
             disk_read_bps: 0,
             disk_write_bps: 0,
@@ -163,6 +187,15 @@ export function useMetricsStream(opts: {
     target.affinity_mask = u.affinity_mask;
     refreshDisplayCache(target, opts.cpuBaseline(), { mask: true });
     refreshCcdBars(target, opts.topology());
+  }
+
+  function applyPriorityUpdated(u: PriorityUpdated) {
+    const byPid = opts.processesByPid();
+    const target = byPid.get(u.pid);
+    if (!target) return;
+    target.priority_class = u.priority_class;
+    target.io_priority = u.io_priority;
+    target.memory_priority = u.memory_priority;
   }
 
   async function start() {
@@ -201,6 +234,7 @@ export function useMetricsStream(opts: {
       onMetrics: applyMetricsWave,
       onProcessDiff: applyProcessDiff,
       onAffinityUpdated: applyAffinityUpdated,
+      onPriorityUpdated: applyPriorityUpdated,
     });
   }
 
@@ -211,6 +245,12 @@ export function useMetricsStream(opts: {
     }
   }
 
+  function cpuHistory(pid: number): number[] {
+    // Read the ref so Vue rerenders the lightweight sparkline once per tick.
+    void historyVersion.value;
+    return cpuHistoryByPid.get(pid) ?? [];
+  }
+
   return {
     streaming,
     toggleBusy,
@@ -219,5 +259,6 @@ export function useMetricsStream(opts: {
     toggle,
     register,
     unregister,
+    cpuHistory,
   };
 }

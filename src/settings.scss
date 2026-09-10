@@ -1,5 +1,5 @@
-// Vuetify 配置文件 (用于 vite-plugin-vuetify 注入 SASS 变量)
-// 留空即可使用默认值。如有需要可在此覆盖 $utilities 等。
+// Vuetify config file (consumed by vite-plugin-vuetify to inject SASS variables).
+// Leave empty to use the defaults. Override $utilities, etc. here if needed.
 @use 'vuetify/settings' with (
   $color-pack: false
 );

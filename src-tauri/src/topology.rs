@@ -1,18 +1,24 @@
-//! CPU 拓扑检测 (CCD 识别修正版)
+//! CPU topology detection (CCD-aware edition).
 //!
-//! 对于 AMD Zen 系列桌面 (尤其 Ryzen 7950X/9950X 这类多 CCD 芯片), Windows 通常
-//! 不通过 `GetLogicalProcessorInformationEx` 的 `RelationProcessorDie` 暴露 CCD
-//! 结构。Process Lasso / Ryzen Master / LibreHardwareMonitor 等工具使用 CPUID
-//! 指令做精确识别: 将线程钉到各个逻辑处理器后执行
-//! `CPUID EAX=0x8000_001E` (AMD Processor Topology Enumeration Leaf, Family 17h+),
-//! 从 `ECX[7:0]` 字段取得 Node_ID (= CCD 编号)。
+//! On AMD Zen desktop parts (especially multi-CCD chips like the Ryzen
+//! 7950X/9950X), Windows does not normally expose the CCD structure through
+//! `GetLogicalProcessorInformationEx`'s `RelationProcessorDie`. Tools such as
+//! Process Lasso, Ryzen Master, and LibreHardwareMonitor use the CPUID
+//! instruction to identify CCDs precisely: pin a thread to each logical
+//! processor, then execute `CPUID EAX=0x8000_001E` (AMD Processor Topology
+//! Enumeration leaf, Family 17h+), and read the `ECX[7:0]` field to obtain
+//! the Node_ID (= CCD index).
 //!
-//! 本模块按以下优先级检测 Die/CCD:
-//!   1. CPUID `Fn8000_001E` 线程钉扎法 (主方案, Process Lasso 同款, Node ID = CCD)
-//!   2. CPUID `Fn8000_0026` (Die ID 回退, 仅旧 Family 19h 特定 SKU 需要)
-//!   3. `RelationProcessorModule` = 9 (Win11 新增, 部分 AMD 配置会把 CCD 标记为 Module)
-//!   4. `RelationProcessorDie` (原有方案, 基本只有 Server SKU 才会输出)
-//!   5. 回退到单一逻辑 Die
+//! This module detects Die/CCD in the following priority order:
+//!   1. CPUID `Fn8000_001E` thread-pinning method (primary, same as Process
+//!      Lasso, Node ID = CCD).
+//!   2. CPUID `Fn8000_0026` (Die ID fallback, needed only for some older
+//!      Family 19h SKUs).
+//!   3. `RelationProcessorModule` = 9 (new in Win11; some AMD configurations
+//!      tag CCDs as Modules).
+//!   4. `RelationProcessorDie` (original approach, essentially only emitted
+//!      by Server SKUs).
+//!   5. Fall back to a single logical Die.
 
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
@@ -23,7 +29,7 @@ use core::arch::x86_64::__cpuid_count;
 #[allow(unused_imports)]
 use windows::Win32::System::SystemInformation::{
     GetLogicalProcessorInformationEx, GetSystemInfo, LOGICAL_PROCESSOR_RELATIONSHIP, RelationAll,
-    RelationNumaNode, RelationProcessorCore, RelationProcessorDie,
+    RelationGroup, RelationNumaNode, RelationProcessorCore, RelationProcessorDie,
     RelationProcessorPackage, SYSTEM_INFO, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
 use windows::Win32::System::Threading::{
@@ -33,37 +39,46 @@ use windows::Win32::System::Threading::{
 
 use crate::models::{CoreInfo, CpuTopology, DieInfo, LogicalProcessorInfo};
 
-/// SMT 标志位 (LTP_PC_SMT)
+/// SMT flag bit (LTP_PC_SMT).
 const LTP_PC_SMT: u8 = 0x1;
 
-/// 已知 LOGICAL_PROCESSOR_RELATIONSHIP 枚举的原始值, 其中有些在 windows crate 版本中不稳定
+/// Raw values of known LOGICAL_PROCESSOR_RELATIONSHIP enumerations; some of
+/// these are not yet stable in the windows crate.
 const RELATION_NUMA_NODE: i32 = 1;
 const RELATION_PROCESSOR_CACHE: i32 = 4;
-/// RelationProcessorModule = 9 (Win11 22H2+ 引入, windows crate 还没稳定封装此枚举)
+/// RelationProcessorModule = 9 (introduced in Win11 22H2+; windows crate has
+/// not yet exposed this enum value).
 const RELATION_PROCESSOR_MODULE: i32 = 9;
 
-/// CPUID 最大扩展功能叶 (EAX=0x8000_0000 返回)
+/// CPUID maximum extended function leaf (returned by EAX=0x8000_0000).
 const CPUID_MAX_EXT_LEAF: u32 = 0x8000_0000;
-/// AMD 扩展拓扑叶 1: Processor Topology Enumeration (Family 17h+, Ryzen 全系列)
-///  - ECX[7:0]   = Node_ID (= CCD 编号, 桌面 Ryzen 最可靠的 CCD 区分来源, Process Lasso 同款)
-///  - ECX[10:8]  = NodesPerProcessor - 1
+/// AMD extended topology leaf 1: Processor Topology Enumeration (Family 17h+,
+/// all Ryzen).
+///  - ECX[7:0]   = Node_ID (= CCD index; the most reliable CCD source for
+///                 desktop Ryzen, same as Process Lasso).
+///  - ECX[10:8]  = NodesPerProcessor - 1.
 const CPUID_AMD_TOPOLOGY_ENUM: u32 = 0x8000_001E;
-/// AMD 扩展拓扑叶 2: Extended APIC ID (旧 Family 19h 某些 SKU 用此叶 ECX[15:8] = Die_ID)
+/// AMD extended topology leaf 2: Extended APIC ID (some older Family 19h SKUs
+/// use ECX[15:8] = Die_ID).
 const CPUID_AMD_EXT_TOPOLOGY: u32 = 0x8000_0026;
-/// CPUID Vendor ID leaf
+/// CPUID Vendor ID leaf.
 const CPUID_VENDOR: u32 = 0x0000_0000;
 
 // ============================================================
-//   对外主入口
+//   Public main entry point
 // ============================================================
 
 pub fn get_cpu_topology() -> Result<CpuTopology, String> {
     let buffer = query_logical_processor_info()?;
 
-    // ---------- Step 1: 解析 Core / Package / Module / Die 关系 ----------
-    let mut core_entries: Vec<(u64, u8, u8)> = Vec::new(); // (mask, flags, efficiency)
-    let mut package_entries: Vec<u64> = Vec::new();
-    let mut die_candidates_winapi: Vec<u64> = Vec::new(); // Die 候选 mask
+    // ---------- Step 1: Parse Core / Package / Module / Die relations ----------
+    let mut core_entries: Vec<(u16, u64, u8, u8)> = Vec::new(); // (group, mask, flags, efficiency)
+    let mut package_entries: Vec<(u16, u64)> = Vec::new();
+    let mut die_candidates_winapi: Vec<(u16, u64)> = Vec::new();
+    // RelationGroup is the topology API's authoritative count for active
+    // Windows processor groups. Keep the GetActiveProcessorGroupCount call
+    // only as a defensive fallback for malformed/provider-limited buffers.
+    let mut relation_group_count: Option<u16> = None;
 
     let mut offset = 0usize;
     while offset + size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() <= buffer.len() {
@@ -77,20 +92,34 @@ pub fn get_cpu_topology() -> Result<CpuTopology, String> {
 
         let rel = entry.Relationship.0;
 
+        if rel == RelationGroup.0 {
+            let group_info = unsafe { &entry.Anonymous.Group };
+            if group_info.ActiveGroupCount > 0 {
+                relation_group_count = Some(group_info.ActiveGroupCount);
+            }
+        }
+
         if rel == RelationProcessorCore.0
             || rel == RelationProcessorPackage.0
             || rel == RelationProcessorDie.0
             || rel == RELATION_PROCESSOR_MODULE
         {
-            let proc_info = unsafe { entry.Anonymous.Processor };
+            // PROCESSOR_RELATIONSHIP ends in a variable-length GroupMask
+            // array. Keep a reference into the original API buffer rather
+            // than copying the one-element Rust projection.
+            let proc_info = unsafe { &entry.Anonymous.Processor };
             if proc_info.GroupCount >= 1 {
-                let mask = proc_info.GroupMask[0].Mask as u64;
-                if rel == RelationProcessorCore.0 {
-                    core_entries.push((mask, proc_info.Flags, proc_info.EfficiencyClass));
-                } else if rel == RelationProcessorPackage.0 {
-                    package_entries.push(mask);
-                } else if !die_candidates_winapi.iter().any(|&m| m == mask) {
-                    die_candidates_winapi.push(mask);
+                for gi in 0..proc_info.GroupCount as usize {
+                    let group_mask = unsafe { *proc_info.GroupMask.as_ptr().add(gi) };
+                    let group = group_mask.Group;
+                    let mask = group_mask.Mask as u64;
+                    if rel == RelationProcessorCore.0 {
+                        core_entries.push((group, mask, proc_info.Flags, proc_info.EfficiencyClass));
+                    } else if rel == RelationProcessorPackage.0 {
+                        package_entries.push((group, mask));
+                    } else if !die_candidates_winapi.iter().any(|&(g, m)| g == group && m == mask) {
+                        die_candidates_winapi.push((group, mask));
+                    }
                 }
             }
         }
@@ -99,16 +128,17 @@ pub fn get_cpu_topology() -> Result<CpuTopology, String> {
     }
 
     if core_entries.is_empty() {
-        return Err("未检测到任何处理器核心信息".to_string());
+        return Err("no processor core information detected".to_string());
     }
 
-    // ---------- Step 2: CPUID 法得到每个逻辑处理器的 die_id ----------
-    // ★关键★: detect_die_by_cpuid 会对 32 个 LP 逐个 SetThreadAffinityMask,
-    // 这会修改当前线程的亲和性。如果直接在 Tauri 命令线程上执行,
-    // tokio async runtime 的调度会被干扰, 导致整个应用卡死!
-    // 必须放到独立线程里执行, join 等待结果。
-    let total_lps_guess: u32 = core_entries.iter().map(|(m, _, _)| m.count_ones()).sum();
-    let lp_die_from_cpuid: Option<Vec<u32>> = std::thread::scope(|s| {
+    // ---------- Step 2: CPUID-based die_id per logical processor ----------
+    // ★Key point★: detect_die_by_cpuid calls SetThreadAffinityMask once per LP,
+    // which mutates the current thread's affinity. Running it directly on a
+    // Tauri command thread will disrupt the tokio async runtime and freeze
+    // the whole app, so it must be executed in a dedicated thread that we
+    // then join.
+    let total_lps_guess: u32 = core_entries.iter().map(|(_, m, _, _)| m.count_ones()).sum();
+    let lp_die_from_cpuid: Option<Vec<u32>> = if cpum_core::procwin::active_group_count() > 1 { None } else { std::thread::scope(|s| {
         let handle = s.spawn(move || {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 detect_die_by_cpuid(total_lps_guess)
@@ -116,12 +146,12 @@ pub fn get_cpu_topology() -> Result<CpuTopology, String> {
             .unwrap_or_else(|_| None)
         });
         handle.join().unwrap_or(None)
-    });
+    }) };
 
     let mut core_die_ids: Vec<u32> = Vec::with_capacity(core_entries.len());
 
     if let Some(lp2die) = &lp_die_from_cpuid {
-        for &(mask, _, _) in &core_entries {
+        for &(_, mask, _, _) in &core_entries {
             let mut assigned: Option<u32> = None;
             for bit in 0..64u32 {
                 if (mask >> bit) & 1 == 1 {
@@ -134,17 +164,17 @@ pub fn get_cpu_topology() -> Result<CpuTopology, String> {
             core_die_ids.push(assigned.unwrap_or(0));
         }
     } else {
-        for &(mask, _, _) in &core_entries {
+        for &(group, mask, _, _) in &core_entries {
             let die_id = die_candidates_winapi
                 .iter()
-                .position(|&dm| mask & dm == mask)
+                .position(|&(candidate_group, dm)| group == candidate_group && mask & dm == mask)
                 .map(|p| p as u32)
                 .unwrap_or(0);
             core_die_ids.push(die_id);
         }
     }
 
-    // ---------- Step 3: 按逻辑 Die ID 重编号 (紧凑 0..N-1) ----------
+    // ---------- Step 3: Renumber logical Die IDs (compact 0..N-1) ----------
     let unique_die_ids: Vec<u32> = {
         let mut v = core_die_ids.clone();
         v.sort_unstable();
@@ -158,21 +188,21 @@ pub fn get_cpu_topology() -> Result<CpuTopology, String> {
             .unwrap_or(0) as u32
     };
 
-    // ---------- Step 4: 构建 core / lp / die 输出 ----------
+    // ---------- Step 4: Build core / lp / die output ----------
     let mut logical_processors: Vec<LogicalProcessorInfo> = Vec::new();
     let mut cores: Vec<CoreInfo> = Vec::new();
     let n_dies = unique_die_ids.len().max(1);
     let mut die_threads: Vec<Vec<u32>> = vec![Vec::new(); n_dies];
     let mut die_cores: Vec<Vec<u32>> = vec![Vec::new(); n_dies];
 
-    for (core_idx, &(mask, flags, eff)) in core_entries.iter().enumerate() {
+    for (core_idx, &(group, mask, flags, eff)) in core_entries.iter().enumerate() {
         let core_id = core_idx as u32;
         let raw_die = core_die_ids[core_idx];
         let die_id = compact_die_of(raw_die);
 
         let package_id = package_entries
             .iter()
-            .position(|&pmask| mask & pmask == mask)
+            .position(|&(package_group, pmask)| package_group == group && mask & pmask == mask)
             .map(|p| p as u32)
             .unwrap_or(0);
 
@@ -181,10 +211,13 @@ pub fn get_cpu_topology() -> Result<CpuTopology, String> {
         let mut smt_thread_id = 0u32;
         for bit in 0..64u32 {
             if (mask >> bit) & 1 == 1 {
-                threads.push(bit);
-                die_threads[die_id as usize].push(bit);
+                let global_index = group as u32 * 64 + bit;
+                threads.push(global_index);
+                die_threads[die_id as usize].push(global_index);
                 logical_processors.push(LogicalProcessorInfo {
-                    index: bit,
+                    index: global_index,
+                    group,
+                    group_index: bit as u8,
                     core_id,
                     die_id,
                     package_id,
@@ -210,13 +243,13 @@ pub fn get_cpu_topology() -> Result<CpuTopology, String> {
     let multi_die = n_dies >= 2;
     let dies: Vec<DieInfo> = (0..n_dies as u32)
         .map(|die_id| {
-            let union_mask: u64 = die_threads[die_id as usize]
-                .iter()
-                .fold(0u64, |acc, &t| acc | (1u64 << t));
-            let package_id = package_entries
-                .iter()
-                .position(|&pmask| union_mask & pmask == union_mask)
-                .map(|i| i as u32)
+            // A die can span a processor group boundary on large systems;
+            // do not collapse its global LP indices into one u64 here. The
+            // owning cores already carry the group-aware package mapping.
+            let package_id = die_cores[die_id as usize]
+                .first()
+                .and_then(|core_id| cores.get(*core_id as usize))
+                .map(|core| core.package_id)
                 .unwrap_or(0);
             DieInfo {
                 id: die_id,
@@ -229,30 +262,34 @@ pub fn get_cpu_topology() -> Result<CpuTopology, String> {
         .collect();
 
     let total_logical_processors = logical_processors.len() as u32;
+    let group_count = relation_group_count
+        .unwrap_or_else(cpum_core::procwin::active_group_count);
     Ok(CpuTopology {
         logical_processors,
         cores,
         dies,
         total_logical_processors,
-        single_group: true,
+        group_count,
+        single_group: group_count <= 1,
     })
 }
 
 // ============================================================
-//   CPUID 线程钉扎法
+//   CPUID thread-pinning method
 // ============================================================
 
-/// 获取当前系统真正的全局可用 affinity mask (system_mask).
+/// Get the true global usable affinity mask (system_mask) of the current system.
 ///
-/// ⚠️ 关键修复（Ryzen 9000 32-LP 场景）：
-/// 有些工具 (Process Lasso / 启动器 / 父进程) 可能**在进程级别**把
-/// process affinity mask 限制到低 16 个 LP，此时调用
-/// `SetThreadAffinityMask(thread, 1 << 16..=31)` 会直接返回 0 (失败) ——
-/// 因为**线程级 mask 不能超出进程级 mask**。
+/// ⚠️ Critical fix (Ryzen 9000 32-LP scenario):
+/// Some tools (Process Lasso / launcher / parent process) may **restrict the
+/// process-level** affinity mask to the lower 16 LPs. In that state, calling
+/// `SetThreadAffinityMask(thread, 1 << 16..=31)` returns 0 (failure) because
+/// the **thread-level mask cannot exceed the process-level mask**.
 ///
-/// 解决：把当前进程的 affinity mask **先显式扩到 system_mask**
-/// (Win32 允许这么做, 不需要管理员权限), 之后才能 pin 到 LP 16-31。
-/// 返回 (original_process_mask, system_mask), 这样调用完后可还原。
+/// Workaround: explicitly expand the current process's affinity mask to
+/// `system_mask` first (Win32 allows this without admin rights); only then can
+/// we pin to LPs 16-31. Returns `(original_process_mask, system_mask)` so the
+/// caller can restore the process mask afterwards.
 fn expand_process_affinity_to_system() -> Option<(usize, usize)> {
     unsafe {
         let mut process_mask: usize = 0;
@@ -262,22 +299,23 @@ fn expand_process_affinity_to_system() -> Option<(usize, usize)> {
         if system_mask == 0 {
             return None;
         }
-        // 先尝试把进程级 mask 扩到全系统可用 LP。
-        // (如果系统不允许或失败, 退回到原 process_mask)
+        // First try to expand the process-level mask to the full set of
+        // usable LPs. If the system disallows it, fall back to the original
+        // process_mask.
         if process_mask != system_mask {
             let _ = SetProcessAffinityMask(GetCurrentProcess(), system_mask);
-            // 再读一次, 确认实际生效的是什么
+            // Read it again to confirm what actually took effect
             let mut pm: usize = 0;
             let mut sm: usize = 0;
             if GetProcessAffinityMask(GetCurrentProcess(), &mut pm, &mut sm).is_ok() {
-                return Some((process_mask, pm)); // 实际的 system_mask 就是现在的 pm
+                return Some((process_mask, pm)); // The actual system_mask is the new pm
             }
         }
         Some((process_mask, system_mask))
     }
 }
 
-/// 还原进程 affinity mask (可选操作)
+/// Restore the process affinity mask (optional helper).
 #[allow(dead_code)]
 fn restore_process_affinity(original: usize) {
     unsafe {
@@ -285,15 +323,17 @@ fn restore_process_affinity(original: usize) {
     }
 }
 
-/// 尝试通过 CPUID 识别每个逻辑处理器的 Die_ID。
-/// 方法优先级 (与 Process Lasso / LibreHardwareMonitor 对齐):
-///   1. Fn8000_001E (Processor Topology Enum) → ECX[7:0] = Node_ID = CCD
-///      (桌面 Ryzen 7950X / 9950X 等多 CCD 芯片最可靠的来源)
-///   2. Fn8000_0026 (Extended APIC ID)      → ECX[15:8] = Die_ID
-///      (旧 Family 19h 部分 SKU; Node_ID 全 0 时再试这里)
-///   3. Fn8000_001E EAX = x2APIC ID → 找最高的有效分桶位 (部分 BIOS 会把 Node_ID 填 0,
-///      但 x2APIC 的高位仍然是按 CCD 分区的, 例如 9950X CCD0=APIC 0..15 / CCD1=APIC 16..31)
-/// 返回 `None` 表示应回退到 WinAPI Die 候选。
+/// Try to identify each logical processor's Die_ID via CPUID.
+/// Method priority (aligned with Process Lasso / LibreHardwareMonitor):
+///   1. Fn8000_001E (Processor Topology Enum) -> ECX[7:0] = Node_ID = CCD
+///      (most reliable source for multi-CCD desktop Ryzen 7950X / 9950X, etc.).
+///   2. Fn8000_0026 (Extended APIC ID)        -> ECX[15:8] = Die_ID
+///      (some older Family 19h SKUs; fall back here if Node_ID is all zero).
+///   3. Fn8000_001E EAX = x2APIC ID -> find the highest bit that splits the
+///      population into two roughly equal buckets (some BIOSes zero out
+///      Node_ID but still partition via x2APIC high bits, e.g. 9950X with
+///      CCD0 = APIC 0..15 / CCD1 = APIC 16..31).
+/// Returns `None` to signal "fall back to WinAPI Die candidates".
 fn detect_die_by_cpuid(total_lps_guess: u32) -> Option<Vec<u32>> {
     if !cfg!(target_arch = "x86_64") {
         return None;
@@ -311,28 +351,31 @@ fn detect_die_by_cpuid(total_lps_guess: u32) -> Option<Vec<u32>> {
     }
 
     let thread = unsafe { GetCurrentThread() };
-    // 先把进程级 affinity 扩到 system_mask (解除父进程/启动器的低 16-LP 限制)
+    // First expand the process-level affinity to system_mask (to escape any
+    // low-16-LP limit set by the parent / launcher).
     let (orig_proc_mask, sys_mask) = match expand_process_affinity_to_system() {
         Some(pair) => pair,
         None => return None,
     };
     let old_affinity = unsafe { SetThreadAffinityMask(thread, sys_mask) };
     if old_affinity == 0 {
-        // 即使线程级 mask 设不回去, 也要尽量还原进程 mask
+        // Even if the thread-level mask can't be set back, try to restore the
+        // process-level mask
         restore_process_affinity(orig_proc_mask);
         return None;
     }
     let orig_proc_for_cleanup = Some(orig_proc_mask);
 
     // ------------------------------------------------------------------
-    // 单轮 pinning 就把三个候选字段都读下来, 避免反复 SetThreadAffinityMask + 线程迁移
-    // 每个 LP 得到: (node_id, die_id_26, x2apic_id)
+    // One round of pinning reads all three candidate fields at once, to
+    // avoid repeated SetThreadAffinityMask + thread migration.
+    // For each LP we get: (node_id, die_id_26, x2apic_id)
     // ------------------------------------------------------------------
     struct PerLp {
         node_id: u32,    // Fn001E ECX[7:0]
         die_id_26: u32,  // Fn0026 ECX[15:8]
         x2apic: u32,     // Fn001E EAX
-        ok: bool,        // pinning 是否成功
+        ok: bool,        // Whether pinning succeeded
     }
     let mut per_lp: Vec<PerLp> = (0..total)
         .map(|_| PerLp { node_id: 0, die_id_26: 0, x2apic: 0, ok: false })
@@ -344,8 +387,10 @@ fn detect_die_by_cpuid(total_lps_guess: u32) -> Option<Vec<u32>> {
         if r == 0 {
             continue;
         }
-        // 让 OS 实际切过去; Pinning 成功不代表已经在那个核上了
-        // 用微秒级 sleep 代替 yield_now, 避免在 Tauri 线程池里引发调度风暴
+        // Wait for the OS to actually migrate us; a successful pin does not
+        // guarantee the thread is already running on that core. Use a
+        // microsecond sleep instead of yield_now to avoid scheduler storms
+        // inside the Tauri thread pool.
         std::thread::sleep(std::time::Duration::from_micros(200));
 
         let mut node_vals = [0u32; 2];
@@ -368,7 +413,7 @@ fn detect_die_by_cpuid(total_lps_guess: u32) -> Option<Vec<u32>> {
     }
     let restore = || unsafe { SetThreadAffinityMask(thread, old_affinity); };
 
-    // ---------- 方法 1: Fn8000_001E ECX[7:0] = Node_ID ----------
+    // ---------- Method 1: Fn8000_001E ECX[7:0] = Node_ID ----------
     if max_ext >= CPUID_AMD_TOPOLOGY_ENUM {
         let mut result: Vec<u32> = vec![u32::MAX; total];
         let mut any_different = false;
@@ -392,7 +437,7 @@ fn detect_die_by_cpuid(total_lps_guess: u32) -> Option<Vec<u32>> {
         }
     }
 
-    // ---------- 方法 2: Fn8000_0026 ECX[15:8] = Die_ID ----------
+    // ---------- Method 2: Fn8000_0026 ECX[15:8] = Die_ID ----------
     if max_ext >= CPUID_AMD_EXT_TOPOLOGY {
         let mut result: Vec<u32> = vec![u32::MAX; total];
         let mut any_different = false;
@@ -416,10 +461,12 @@ fn detect_die_by_cpuid(total_lps_guess: u32) -> Option<Vec<u32>> {
         }
     }
 
-    // ---------- 方法 3: x2APIC 高位分桶 (BIOS 会隐藏 Node_ID 但仍然保留 x2APIC 分区) ----------
-    // 只在「看起来像多 CCD 桌面 Ryzen」时启用 (>=24 LP 或 core mask 明显分 2 段的情况太复杂
-    // 这里用简单判定: 至少 16 LP 且 x2APIC 集合的最大 - 最小 + 1 == 成功探测到的 LP 数
-    // (说明 x2APIC 是连续编号, 这正是桌面 Ryzen 的布局)。
+    // ---------- Method 3: x2APIC high-bit bucketing (BIOS hides Node_ID
+    // but still partitions via x2APIC) ----------
+    // Enabled only when it "looks like a multi-CCD desktop Ryzen": at least
+    // 16 LPs, and the x2APIC set's max - min + 1 == number of successfully
+    // probed LPs (which means x2APIC is contiguously numbered - the desktop
+    // Ryzen layout).
     if max_ext >= CPUID_AMD_TOPOLOGY_ENUM {
         let ok_lps: Vec<usize> = (0..total).filter(|&lp| per_lp[lp].ok).collect();
         if ok_lps.len() >= 16 {
@@ -430,9 +477,10 @@ fn detect_die_by_cpuid(total_lps_guess: u32) -> Option<Vec<u32>> {
             let max_x = xs.last().copied().unwrap_or(0);
             let span = (max_x - min_x + 1) as usize;
             let unique = xs.len();
-            // 连续 (span == unique) 且跨度 >= 16 → 像 2CCD 桌面布局
+            // Contiguous (span == unique) and span >= 16 -> looks like 2-CCD desktop layout
             if span == unique && span >= 16 {
-                // 找最高的那个 bit: 其 0/1 分桶至少各占 25% (避免 SMT 最低位误判)
+                // Find the highest bit such that its 0/1 buckets each hold at
+                // least 25% (avoids being fooled by SMT's lowest bit).
                 let highest_bit = 31u32.saturating_sub(span.leading_zeros());
                 let mut bucket_bit = None;
                 for b in (1..=highest_bit).rev() {
@@ -466,17 +514,21 @@ fn detect_die_by_cpuid(total_lps_guess: u32) -> Option<Vec<u32>> {
         }
     }
 
-    // ---------- 方法 4: 直接按 LP 编号均分 (最后兜底, 命中 9950X 2CCD=LP 0-15/16-31) ----------
-    // 桌面 Ryzen 的 Win32 ProcessorCore mask 顺序就是: Core0→LP 0,1  Core1→LP 2,3 ...
-    // 也就是 LP 0..N/2 在 CCD0, LP N/2..N 在 CCD1。如果成功探测到的 LP 数 >=16
-    // 且 LP 总数本身就是 2 的幂 (16/32/64) 或恰好是 2 的整倍数且两段都 >= 8, 直接均分。
+    // ---------- Method 4: Even LP split (last resort - matches 9950X 2CCD = LP 0-15/16-31) ----------
+    // On desktop Ryzen, the Win32 ProcessorCore mask order is:
+    // Core0 -> LP 0,1  Core1 -> LP 2,3 ...
+    // i.e. LP 0..N/2 on CCD0 and LP N/2..N on CCD1. If the number of LPs is
+    // a power of two (16/32/64) or an exact multiple of two with both halves
+    // >= 8, just split evenly.
     {
         let ok_lps: Vec<usize> = (0..total).filter(|&lp| per_lp[lp].ok).collect();
-        // 不严格要求所有 LP 都 pin 成功, 只要 ok 的 >= 16 或 ok 数覆盖了 80%+ 就用
+        // We don't strictly require every LP to pin successfully; we just
+        // need at least 16, or coverage of 80%+ of the total.
         let ok_count = ok_lps.len();
         if total >= 16 && total % 2 == 0 && ok_count.max(1) * 5 >= total * 4 {
             let half = total / 2;
-            // 两段都要 >= 8 LP (避免 16 核单 CCD 被硬拆)
+            // Each half must hold at least 8 LPs (avoid splitting a 16-core
+            // single-CCD chip in two).
             if half >= 8 {
                 let mut result: Vec<u32> = vec![0u32; total];
                 for lp in 0..total {
@@ -501,7 +553,7 @@ fn detect_die_by_cpuid(total_lps_guess: u32) -> Option<Vec<u32>> {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn cpuid_leaf(leaf: u32, sub_leaf: u32) -> (u32, u32, u32, u32) {
-    let res = unsafe { __cpuid_count(leaf, sub_leaf) };
+    let res = __cpuid_count(leaf, sub_leaf);
     (res.eax, res.ebx, res.ecx, res.edx)
 }
 
@@ -537,7 +589,7 @@ unsafe fn cpuid_max_ext_leaf() -> u32 {
 }
 
 // ============================================================
-//   Win32 低层调用
+//   Win32 low-level calls
 // ============================================================
 
 fn query_logical_processor_info() -> Result<Vec<u8>, String> {
@@ -546,7 +598,7 @@ fn query_logical_processor_info() -> Result<Vec<u8>, String> {
         let _ = GetLogicalProcessorInformationEx(RelationAll, None, &mut len);
     }
     if len == 0 {
-        return Err("GetLogicalProcessorInformationEx 返回 0 长度".to_string());
+        return Err("GetLogicalProcessorInformationEx returned length 0".to_string());
     }
     let mut buffer: Vec<u8> = vec![0u8; len as usize];
     let result = unsafe {
@@ -556,14 +608,15 @@ fn query_logical_processor_info() -> Result<Vec<u8>, String> {
             &mut len,
         )
     };
-    result.map_err(|e| format!("GetLogicalProcessorInformationEx 失败: {}", e))?;
+    result.map_err(|e| format!("GetLogicalProcessorInformationEx failed: {}", e))?;
     Ok(buffer)
 }
 
 // ============================================================
-//   调试辅助: Dump 原始 Win32 拓扑 + CPUID 结果
+//   Debug helper: dump raw Win32 topology + CPUID results
 // ============================================================
 
+#[allow(dead_code)]
 pub fn dump_raw_topology() -> String {
     let buffer = match query_logical_processor_info() {
         Ok(b) => b,
@@ -630,7 +683,7 @@ pub fn dump_raw_topology() -> String {
         offset += entry_size;
     }
 
-    // ---- CPUID 调试信息 ----
+    // ---- CPUID debug information ----
     out.push_str("\n=== CPUID (AMD extended topology leaf) ===\n");
     if !cfg!(target_arch = "x86_64") {
         out.push_str("Not x86_64, skipped.\n");
@@ -651,8 +704,9 @@ pub fn dump_raw_topology() -> String {
         }
 
         // ================================================================
-        // 无论是否检测到 multi-die, 都强制打印完整 per-LP 三元组 (Node/x2APIC/Die)
-        // 这样不管是 BIOS 隐藏了 Node_ID, 还是 pinning 不稳定, 都能从原始值判断
+        // Regardless of whether multi-die was detected, force-print the full
+        // per-LP triple (Node/x2APIC/Die) so that whether the BIOS hides
+        // Node_ID or the pinning is flaky, the raw values can be inspected.
         // ================================================================
         let total_probe = 32usize;
         out.push_str(&format!(
@@ -663,7 +717,8 @@ pub fn dump_raw_topology() -> String {
         out.push_str("  ------------------------------------\n");
 
         let thread = unsafe { GetCurrentThread() };
-        // 先扩进程级 mask, 否则 LP 16-31 pinning 会因进程 mask 被限制而全部失败
+        // First expand the process-level mask; otherwise LP 16-31 pinning
+        // will all fail due to the restricted process mask.
         let (orig_proc_mask, sys_mask) = expand_process_affinity_to_system()
             .unwrap_or((0xFFFF_FFFF, 0xFFFF_FFFF));
         let old = unsafe { SetThreadAffinityMask(thread, sys_mask) };
@@ -692,7 +747,7 @@ pub fn dump_raw_topology() -> String {
             restore_process_affinity(orig_proc_mask);
         }
 
-        // ---- 跑一次真正的 detect, 再把结果打印出来 ----
+        // ---- Run the real detect once and print the result ----
         out.push_str("\n[detect_die_by_cpuid(32) final result]\n");
         match detect_die_by_cpuid(total_probe as u32) {
             Some(map) => {
@@ -710,12 +765,12 @@ pub fn dump_raw_topology() -> String {
                 }
             }
             None => {
-                out.push_str("  -> Returned None (最终放弃多 CCD 识别, 回退到 WinAPI / 单 Die).\n");
+                out.push_str("  -> Returned None (giving up on multi-CCD detection, falling back to WinAPI / single Die).\n");
             }
         }
     }
 
-    // ---- 最终: 调一次 get_cpu_topology(), 打印真正会被前端使用的 Die/threads 列表 ----
+    // ---- Final: call get_cpu_topology() once and print the Die/threads list the frontend actually uses ----
     out.push_str("\n=== Final CpuTopology::dies mapping (what frontend actually uses) ===\n");
     match get_cpu_topology() {
         Ok(topo) => {
@@ -738,7 +793,8 @@ pub fn dump_raw_topology() -> String {
     }
 
     // ================================================================
-    // 把完整诊断落盘到 当前工作目录\cpum-topology-dump.txt, 方便用户一键复制给开发者
+    // Write the full diagnostic to <cwd>\cpum-topology-dump.txt so the
+    // user can one-click copy it to the developer.
     // ================================================================
     let save_path: Option<std::path::PathBuf> = (|| {
         let dir = std::env::current_dir().ok()?;
@@ -748,34 +804,37 @@ pub fn dump_raw_topology() -> String {
     })();
     match save_path {
         Some(p) => out.push_str(&format!(
-            "\n\n[诊断已自动保存] 完整报告已写入: {}\n",
+            "\n\n[diagnostic auto-saved] full report written to: {}\n",
             p.display()
         )),
-        None => out.push_str("\n\n[诊断未保存] 自动写入当前目录失败, 请手动复制上方文本.\n"),
+        None => out.push_str("\n\n[diagnostic not saved] auto-write to current directory failed; please copy the text above manually.\n"),
     }
 
     out
 }
 
 // ============================================================
-//   拓扑缓存 (加速启动, CPU 拓扑几乎不变, 只有换 CPU 时才变)
+//   Topology cache (faster startup - CPU topology almost never changes,
+//   only invalidated when the CPU is replaced)
 // ============================================================
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct TopologyCache {
-    /// 硬件签名: 签名变了说明 CPU 被更换 / 主板变了, 缓存失效
+    /// Hardware signature: a change means the CPU or motherboard was swapped
+    /// and the cache is invalid.
     pub hw_signature: String,
-    /// 缓存写入时的 unix 秒 (做过期用, 目前不强制过期, 仅做参考)
+    /// Unix seconds when the cache was written (used for expiry, currently
+    /// not enforced - informational only).
     pub ts_secs: u64,
-    /// 实际的拓扑数据
+    /// The actual topology data.
     pub topology: CpuTopology,
 }
 
-/// CPUID Processor Info Leaf (EAX=1) 的 family 提取。
-/// 这是 x86/x86_64 通用字段, 不区分 Intel/AMD。
+/// Extract the family/model from CPUID Processor Info Leaf (EAX=1).
+/// This is a generic x86/x86_64 field, not Intel/AMD-specific.
 #[cfg(target_arch = "x86_64")]
 unsafe fn cpuid_family_model() -> (u32, u32) {
-    // 实际的 family = BaseFamily + (ExtendedFamily if BaseFamily==0Fh else 0)
+    // Real family = BaseFamily + (ExtendedFamily if BaseFamily==0Fh else 0)
     let (eax, _, _, _) = unsafe { cpuid_leaf(1, 0) };
     let base_family = (eax >> 8) & 0xF;
     let ext_family = (eax >> 20) & 0xFF;
@@ -798,15 +857,15 @@ unsafe fn cpuid_family_model() -> (u32, u32) {
     (0, 0)
 }
 
-/// 轻量硬件签名 (不 pinning, 不触发 SetThreadAffinityMask → <1ms)。
-/// 组成: vendor-family-model-total_lps_count
+/// Lightweight hardware signature (no pinning, no SetThreadAffinityMask -> <1ms).
+/// Composition: vendor-family-model-total_lps_count.
 pub fn hw_signature_fast(total_lps: u32) -> String {
     let vendor = unsafe { cpuid_vendor() };
     let (family, model) = unsafe { cpuid_family_model() };
     format!("{}-{:X}-{:X}-{}", vendor, family, model, total_lps)
 }
 
-/// 通过 GetSystemInfo 拿逻辑处理器数 (<1ms, 不做 CPUID pinning)
+/// Get the logical processor count via GetSystemInfo (<1ms, no CPUID pinning).
 pub fn sys_info_logical_processor_count() -> Option<u32> {
     unsafe {
         let mut si: SYSTEM_INFO = std::mem::zeroed();
@@ -823,9 +882,10 @@ fn topology_cache_path(base_dir: &Path) -> PathBuf {
     base_dir.join("cpu_topology_cache.json")
 }
 
-/// 从缓存文件读取拓扑。返回:
-///   - Ok(Some(data)): 读成功, 签名匹配
-///   - Ok(None):       文件不存在 / 签名不匹配 / JSON 损坏 (调用方就跑真实探测)
+/// Read topology from the cache file. Returns:
+///   - Ok(Some(data)): read OK, signature matches.
+///   - Ok(None):       file missing / signature mismatch / JSON corrupt
+///                     (caller falls through to real detection).
 pub fn load_topology_cache(
     base_dir: &Path,
     expected_signature: &str,
@@ -834,7 +894,7 @@ pub fn load_topology_cache(
     if !path.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("读缓存失败: {e}"))?;
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read cache failed: {e}"))?;
     let parsed: TopologyCache = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(_) => return Ok(None),
@@ -845,14 +905,15 @@ pub fn load_topology_cache(
     Ok(Some(parsed))
 }
 
-/// 把拓扑写入缓存 (签名通过调用方传入的 fast signature 比较, 避免调用方重新 pinning)
+/// Write the topology to the cache. The signature is supplied by the caller
+/// (computed via the fast signature) to avoid having the writer re-pin.
 pub fn save_topology_cache(
     base_dir: &Path,
     topology: &CpuTopology,
     signature: &str,
 ) -> Result<(), String> {
     if let Err(e) = std::fs::create_dir_all(base_dir) {
-        return Err(format!("创建缓存目录失败: {e}"));
+        return Err(format!("failed to create cache directory: {e}"));
     }
     let cache = TopologyCache {
         hw_signature: signature.into(),
@@ -862,8 +923,8 @@ pub fn save_topology_cache(
             .unwrap_or(0),
         topology: topology.clone(),
     };
-    let json = serde_json::to_string(&cache).map_err(|e| format!("序列化缓存失败: {e}"))?;
+    let json = serde_json::to_string(&cache).map_err(|e| format!("failed to serialize cache: {e}"))?;
     let path = topology_cache_path(base_dir);
-    std::fs::write(&path, json).map_err(|e| format!("写缓存失败: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("failed to write cache: {e}"))?;
     Ok(())
 }

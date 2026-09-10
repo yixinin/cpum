@@ -2,6 +2,7 @@ import { ref, computed } from "vue";
 import type { ProcessInfo, CpuTopology, CpuScaleMode } from "../types";
 import { emptyDisplay, refreshDisplayCache, refreshCcdBars, parseMask } from "../types";
 import { listProcesses, listProcessesLight, listProcessesCached, setProcessAffinity, applyAffinityRules } from "../api";
+import { t } from "../i18n";
 
 /**
  * Process list lifecycle: bootstrap (cached -> light -> full), refresh, search filter.
@@ -62,7 +63,7 @@ export function useProcessManager(opts: {
       for (const p of result) initDisplay(p);
       processes.value = result;
     } catch (e) {
-      opts.showSnack(`加载进程列表失败: ${e}`, "error");
+      opts.showSnack(t("loadProcessesFailed", { error: String(e) }), "error");
     } finally {
       loading.value = false;
     }
@@ -72,14 +73,14 @@ export function useProcessManager(opts: {
   async function resetAffinity(p: ProcessInfo) {
     const sysMask = parseMask(p.system_affinity_mask);
     if (sysMask === 0n) {
-      opts.showSnack("无法读取系统亲和性, 重置失败", "error");
+      opts.showSnack(t("resetNoSysMask"), "error");
       return;
     }
     try {
       await setProcessAffinity(p.pid, sysMask);
-      opts.showSnack(`已重置 ${p.name} (PID ${p.pid}) 到默认亲和性`, "success");
+      opts.showSnack(t("resetDone", { name: p.name, pid: p.pid }), "success");
     } catch (e) {
-      opts.showSnack(`重置失败: ${e}`, "error");
+      opts.showSnack(t("resetFailed", { error: String(e) }), "error");
     }
   }
 
@@ -88,11 +89,11 @@ export function useProcessManager(opts: {
     try {
       const count = await applyAffinityRules();
       if (count > 0) {
-        opts.showSnack(`已应用规则到 ${count} 个进程`, "success");
+        opts.showSnack(t("rulesAppliedTo", { count }), "success");
         await refreshFull();
       }
     } catch (e) {
-      opts.showSnack(`应用规则失败: ${e}`, "error");
+      opts.showSnack(t("applyRulesFailed", { error: String(e) }), "error");
     }
   }
 

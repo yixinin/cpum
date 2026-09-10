@@ -1,6 +1,6 @@
 # CPU Manager
 
-[中文文档](README.zh-CN.md)
+[中文版](README.zh-CN.md)
 
 CPU Manager is a Windows desktop application for viewing processes and managing their CPU affinity. It combines a Vue 3 user interface with a Rust/Tauri backend and an optional Windows service that reapplies saved affinity rules automatically.
 
