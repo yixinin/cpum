@@ -3,10 +3,9 @@ import { ref, computed, onMounted, watch } from "vue";
 import type { AffinityRule } from "../api";
 import {
   loadAffinityRules,
-  addAffinityRule,
-  updateAffinityRule,
   deleteAffinityRule,
   applyAffinityRules,
+  updateAffinityRule,
 } from "../api";
 import type { CpuTopology, RuleMatchType } from "../types";
 import {
@@ -14,13 +13,11 @@ import {
   formatMask,
   MATCH_TYPE_OPTIONS,
   RULE_MODE_OPTIONS,
-  PRIORITY_CLASS_OPTIONS,
-  IO_PRIORITY_OPTIONS,
-  MEMORY_PRIORITY_OPTIONS,
   priorityClassLabel,
   ioPriorityLabel,
   memoryPriorityLabel,
 } from "../types";
+import AffinityEditor, { type EditorTarget } from "./AffinityEditor.vue";
 import { useI18n } from "../i18n";
 const { t } = useI18n();
 
@@ -36,66 +33,33 @@ const emit = defineEmits<{
 
 // Rule list
 const rules = ref<AffinityRule[]>([]);
-// Rule currently being edited
-const editingRule = ref<AffinityRule | null>(null);
-const isEditing = ref(false);
-const isNewRule = ref(false);
+// The actual editing UI is provided by the shared AffinityEditor; the rule
+// manager only owns the draft (or the existing rule) and the lifecycle.
+const editorTarget = ref<EditorTarget | null>(null);
 
 // Apply state
 const applying = ref(false);
 const errorMsg = ref<string | null>(null);
 const successMsg = ref<string | null>(null);
 
-// ---------- Dropdown options (computed to stay reactive to locale changes) ----------
-
-const matchTypeItems = computed(() =>
-  MATCH_TYPE_OPTIONS.map((o) => ({ title: t(o.labelKey), value: o.value })),
-);
-const modeItems = computed(() =>
-  RULE_MODE_OPTIONS.map((o) => ({ title: t(o.labelKey), value: o.value })),
-);
-
-/** Priority dropdown items: a leading "Unmanaged" entry (null) followed by the available tiers */
-function prioItems(options: Array<{ value: number; labelKey: string }>) {
-  return [
-    { title: t("prioUnmanaged"), value: null },
-    ...options.map((o) => ({ title: t(o.labelKey), value: o.value })),
-  ];
-}
-const prioClassItems = computed(() => prioItems(PRIORITY_CLASS_OPTIONS));
-const ioPrioItems = computed(() => prioItems(IO_PRIORITY_OPTIONS));
-const memPrioItems = computed(() => prioItems(MEMORY_PRIORITY_OPTIONS));
-
-/** Match hint / placeholder swap with the match mode */
-const matchHint = computed(() => {
-  switch (editingRule.value?.match_type) {
-    case "wildcard":
-      return t("matchWildcardHint");
-    case "path":
-      return t("matchPathHint");
-    default:
-      return t("matchExactHint");
-  }
+// Bridge between AffinityEditor's v-model (boolean) and our editorTarget ref:
+// the editor is "open" iff a target is set. Using a computed writable keeps
+// the close path single-sourced (close -> target = null -> editorOpen -> false).
+const editorOpen = computed<boolean>({
+  get: () => editorTarget.value !== null,
+  set: (val) => {
+    if (!val) editorTarget.value = null;
+  },
 });
-const patternPlaceholder = computed(() => {
-  switch (editingRule.value?.match_type) {
-    case "wildcard":
-      return t("patternPlaceholderWildcard");
-    case "path":
-      return t("patternPlaceholderPath");
-    default:
-      return t("ruleNamePlaceholder");
-  }
-});
-const modeHint = computed(() =>
-  editingRule.value?.mode === "soft" ? t("modeSoftHint") : t("modeStrictHint"),
-);
 
+// ---------- Helpers (used by the list rows) ----------
 function matchTypeLabel(mt: RuleMatchType): string {
-  return t(MATCH_TYPE_OPTIONS.find((o) => o.value === mt)?.labelKey ?? "matchExact");
+  const opt = MATCH_TYPE_OPTIONS.find((o) => o.value === mt);
+  return opt ? t(opt.labelKey) : mt;
 }
 function modeLabel(mode: string): string {
-  return mode === "soft" ? t("modeSoft") : t("modeStrict");
+  const opt = RULE_MODE_OPTIONS.find((o) => o.value === mode);
+  return opt ? t(opt.labelKey) : mode;
 }
 
 /** One-line summary of the priorities this rule manages (e.g. "CPU: High · IO: Low"); "-" when nothing is managed */
@@ -131,9 +95,7 @@ function newRuleDraft(): AffinityRule {
   return {
     id: "",
     process_name: "",
-    mask: props.topology
-      ? groupMasks?.[0] ?? "0xFF"
-      : "0xFF",
+    mask: props.topology ? groupMasks?.[0] ?? "0xFF" : "0xFF",
     group_masks: groupMasks,
     enabled: true,
     created_at: Date.now() / 1000,
@@ -146,95 +108,27 @@ function newRuleDraft(): AffinityRule {
   };
 }
 
-// Add a new rule
+// Open the shared editor in "new rule" mode
 function addRule() {
-  isNewRule.value = true;
-  editingRule.value = newRuleDraft();
-  isEditing.value = true;
+  editorTarget.value = { kind: "rule", rule: newRuleDraft(), isNew: true };
 }
-
-// Edit a rule
+// Open the shared editor in "edit existing rule" mode
 function editRule(rule: AffinityRule) {
-  isNewRule.value = false;
-  editingRule.value = { ...rule };
-  isEditing.value = true;
+  editorTarget.value = { kind: "rule", rule: { ...rule }, isNew: false };
 }
 
-function hasSelectedCore(mask: string, groupMasks?: string[] | null): boolean {
-  try {
-    return groupMasks ? groupMasks.some((value) => parseMask(value) !== 0n) : parseMask(mask) !== 0n;
-  } catch {
-    return false;
+/** Splice the saved rule into the local list and flash a success toast. */
+function onRuleSaved(saved: AffinityRule) {
+  const idx = rules.value.findIndex((r) => r.id === saved.id);
+  if (idx >= 0) {
+    rules.value[idx] = saved;
+    successMsg.value = t("ruleUpdated");
+  } else {
+    rules.value.push(saved);
+    successMsg.value = t("ruleAdded");
   }
-}
-
-// Save the in-progress edit
-async function saveEdit() {
-  if (!editingRule.value) return;
-
-  errorMsg.value = null;
-  const wasNew = isNewRule.value;
-  const draft = editingRule.value;
-
-  // Validation
-  if (!draft.process_name.trim()) {
-    errorMsg.value = t("enterProcessName");
-    return;
-  }
-
-  try {
-    parseMask(draft.mask);
-  } catch {
-    errorMsg.value = t("invalidMask");
-    return;
-  }
-
-  if (!hasSelectedCore(draft.mask, draft.group_masks)) {
-    errorMsg.value = t("atLeastOneLp");
-    return;
-  }
-
-  try {
-    if (wasNew) {
-      // Backend assigns id / created_at; the rest of the fields come from the edit form
-      const newRule = await addAffinityRule({
-        processName: draft.process_name.trim(),
-        mask: draft.mask,
-        groupMasks: draft.group_masks ?? undefined,
-        note: draft.note,
-        matchType: draft.match_type,
-        mode: draft.mode,
-        priorityClass: draft.priority_class,
-        ioPriority: draft.io_priority,
-        memoryPriority: draft.memory_priority,
-      });
-      rules.value.push(newRule);
-    } else {
-      // Whole-record replacement (located by id)
-      const updated = await updateAffinityRule({
-        ...draft,
-        process_name: draft.process_name.trim(),
-      });
-      const idx = rules.value.findIndex((r) => r.id === updated.id);
-      if (idx >= 0) {
-        rules.value[idx] = updated;
-      }
-    }
-
-    isEditing.value = false;
-    editingRule.value = null;
-    successMsg.value = wasNew ? t("ruleAdded") : t("ruleUpdated");
-    setTimeout(() => (successMsg.value = null), 2000);
-  } catch (e) {
-    errorMsg.value = t("saveRuleFailed", { error: String(e) });
-  }
-}
-
-// Cancel the in-progress edit
-function cancelEdit() {
-  isEditing.value = false;
-  editingRule.value = null;
-  errorMsg.value = null;
+  setTimeout(() => (successMsg.value = null), 2000);
+  editorTarget.value = null;
 }
 
 // Delete a rule (show a confirmation dialog first)
@@ -303,18 +197,6 @@ function maskPreview(mask: string): string {
     return mask;
   }
 }
-
-/** Per-group mask editor uses a compact comma-separated form, preserving
- * group order (group 0 first). The backend is the authority for validation. */
-const groupMasksText = computed({
-  get: () => editingRule.value?.group_masks?.join(", ") ?? "",
-  set: (value: string) => {
-    if (!editingRule.value) return;
-    const masks = value.split(",").map((mask) => mask.trim()).filter(Boolean);
-    editingRule.value.group_masks = masks.length ? masks : null;
-    if (masks[0]) editingRule.value.mask = masks[0];
-  },
-});
 
 function popcount(n: bigint): number {
   let count = 0;
@@ -483,124 +365,14 @@ onMounted(() => {
     </v-card>
   </v-dialog>
 
-  <!-- Edit dialog (separate from the main dialog) -->
-  <v-dialog v-model="isEditing" max-width="640">
-    <v-card>
-      <v-card-title>{{ isNewRule ? t('addRule') : t('editRules') }}</v-card-title>
-      <v-card-text>
-        <!-- The match mode determines what process_name means (name / wildcard / path) -->
-        <v-select
-          v-if="editingRule"
-          v-model="editingRule.match_type"
-          :items="matchTypeItems"
-          :label="t('matchType')"
-          :hint="matchHint"
-          persistent-hint
-          density="compact"
-          variant="outlined"
-          class="mb-3"
-        />
-
-        <v-text-field
-          v-if="topology && topology.group_count > 1"
-          v-model="groupMasksText"
-          :label="t('groupMasks')"
-          :hint="t('groupMasksHint')"
-          persistent-hint
-          density="compact"
-          class="mt-3"
-        />
-
-        <v-text-field
-          v-if="editingRule"
-          v-model="editingRule.process_name"
-          :label="t('ruleNameLabel')"
-          :placeholder="patternPlaceholder"
-          class="mb-3"
-        />
-
-        <v-text-field
-          v-if="editingRule"
-          v-model="editingRule.mask"
-          :label="t('ruleMaskLabel')"
-          placeholder="0xFF"
-          :hint="t('ruleMaskHint')"
-          persistent-hint
-          class="mb-3"
-        />
-
-        <!-- Scheduling mode: strict hard mask / elastic CPU Sets -->
-        <v-select
-          v-if="editingRule"
-          v-model="editingRule.mode"
-          :items="modeItems"
-          :label="t('ruleMode')"
-          :hint="modeHint"
-          persistent-hint
-          density="compact"
-          variant="outlined"
-          class="mb-3"
-        />
-
-        <!-- Managed priorities: null = don't touch -->
-        <template v-if="editingRule">
-          <div class="text-subtitle-2 mb-1">{{ t('rulePriorityLabel') }}</div>
-          <div class="text-caption text-medium-emphasis mb-2">{{ t('rulePriorityHint') }}</div>
-          <v-row dense>
-            <v-col cols="12" sm="4">
-              <v-select
-                v-model="editingRule.priority_class"
-                :items="prioClassItems"
-                :label="t('prioCpu')"
-                density="compact"
-                variant="outlined"
-                hide-details
-              />
-            </v-col>
-            <v-col cols="12" sm="4">
-              <v-select
-                v-model="editingRule.io_priority"
-                :items="ioPrioItems"
-                :label="t('prioIo')"
-                density="compact"
-                variant="outlined"
-                hide-details
-              />
-            </v-col>
-            <v-col cols="12" sm="4">
-              <v-select
-                v-model="editingRule.memory_priority"
-                :items="memPrioItems"
-                :label="t('prioMem')"
-                density="compact"
-                variant="outlined"
-                hide-details
-              />
-            </v-col>
-          </v-row>
-        </template>
-
-        <v-text-field
-          v-if="editingRule"
-          v-model="editingRule.note"
-          :label="t('ruleNoteLabel')"
-          :placeholder="t('ruleNotePlaceholder')"
-          class="mb-3 mt-3"
-        />
-
-        <v-alert v-if="errorMsg" type="error" density="compact" class="mt-3">
-          {{ errorMsg }}
-        </v-alert>
-      </v-card-text>
-      <v-card-actions>
-        <v-spacer />
-        <v-btn @click="cancelEdit">{{ t('cancel') }}</v-btn>
-        <v-btn color="primary" :disabled="!editingRule || !hasSelectedCore(editingRule.mask, editingRule.group_masks)" @click="saveEdit">
-          {{ isNewRule ? t('add') : t('save') }}
-        </v-btn>
-      </v-card-actions>
-    </v-card>
-  </v-dialog>
+  <!-- Shared affinity editor: drives the rule manager's Add / Edit actions
+       (rule mode) and the process-list right-click "Edit Rule" (process mode). -->
+  <AffinityEditor
+    v-model="editorOpen"
+    :target="editorTarget"
+    :topology="topology"
+    @saved="onRuleSaved"
+  />
 
   <!-- Delete-confirmation dialog -->
   <v-dialog :model-value="deleteTarget !== null" @update:model-value="deleteTarget = null" max-width="420">

@@ -1,0 +1,22 @@
+[package]
+name = "cpum-service"
+version = "0.1.0"
+edition = "2021"
+description = "cpum Windows service binary - CPU affinity rule daemon + ProBalance dynamic optimizer"
+
+[[bin]]
+name = "cpum_service"
+path = "src/main.rs"
+# The SCM entry point is not a unit-test harness; service behavior is exercised
+# via integration tests / SCM and the cpum-core testable policy/runtime layers.
+test = false
+
+[dependencies]
+cpum-core = { path = "../cpum-core" }
+windows-service = "0.8.1"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }

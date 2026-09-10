@@ -7,11 +7,15 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-# Rule model / matching / persistence / Win32 write operations are extracted into
-# cpum-core so the GUI (this crate) and the Windows service (cpum_service bin)
-# share a single implementation.
+# Rule model / matching / persistence / Win32 write operations are extracted
+# into cpum-core, which both the GUI (this crate) and the Windows service
+# (crates/cpum-service) depend on. The service is a separate workspace member
+# crate so that the Tauri build script of this crate does not run when only
+# the service binary is being compiled (which would otherwise panic on a
+# `target/release/cpum_service.exe` resource check that has not yet produced
+# the artifact - a chicken-and-egg when both binaries live in one crate).
 [workspace]
-members = ["crates/cpum-core"]
+members = ["crates/cpum-core", "crates/cpum-service"]
 resolver = "2"
 
 [lib]
@@ -26,13 +30,6 @@ name = "cpum"
 path = "src/main.rs"
 # The desktop executable embeds a requireAdministrator manifest and contains
 # no unit tests. Running its generated test harness fails with Windows 740.
-test = false
-
-[[bin]]
-name = "cpum_service"
-path = "src/bin/cpum_service.rs"
-# Service behavior is covered through cpum-core's testable policy/runtime
-# layers; its SCM entry point is not a unit-test harness.
 test = false
 
 [build-dependencies]

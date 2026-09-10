@@ -34,9 +34,6 @@ export function useMetricsStream(opts: {
 }) {
   const streaming = ref(true);
   const toggleBusy = ref(false);
-  const historyVersion = ref(0);
-  const cpuHistoryByPid = new Map<number, number[]>();
-  const HISTORY_POINTS = 60;
   let unlisten: (() => void) | null = null;
   const STREAM_INTERVAL_MS = 1000;
 
@@ -51,10 +48,6 @@ export function useMetricsStream(opts: {
           const target = byPid.get(row[0]);
           if (!target) continue;
           target.cpu_usage_percent = row[1];
-          const history = cpuHistoryByPid.get(target.pid) ?? [];
-          history.push(row[1]);
-          if (history.length > HISTORY_POINTS) history.splice(0, history.length - HISTORY_POINTS);
-          cpuHistoryByPid.set(target.pid, history);
           const d = target._display;
           const displayPercent = scaleCpuPercent(row[1], mode, np);
           d.cpu_text = formatCpuPercent(displayPercent);
@@ -108,7 +101,6 @@ export function useMetricsStream(opts: {
         break;
       }
     }
-    if (wave.wave === 1) historyVersion.value += 1;
   }
 
   function applyProcessDiff(diff: ProcessDiff) {
@@ -120,7 +112,6 @@ export function useMetricsStream(opts: {
       const removeSet = new Set(diff.removed_pids);
       for (let i = procs.length - 1; i >= 0; i--) {
         if (removeSet.has(procs[i].pid)) {
-          cpuHistoryByPid.delete(procs[i].pid);
           procs.splice(i, 1);
         }
       }
@@ -245,12 +236,6 @@ export function useMetricsStream(opts: {
     }
   }
 
-  function cpuHistory(pid: number): number[] {
-    // Read the ref so Vue rerenders the lightweight sparkline once per tick.
-    void historyVersion.value;
-    return cpuHistoryByPid.get(pid) ?? [];
-  }
-
   return {
     streaming,
     toggleBusy,
@@ -259,6 +244,5 @@ export function useMetricsStream(opts: {
     toggle,
     register,
     unregister,
-    cpuHistory,
   };
 }

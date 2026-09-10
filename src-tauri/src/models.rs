@@ -76,6 +76,13 @@ pub struct CpuTopology {
 pub struct ProcessInfo {
     pub pid: u32,
     pub name: String,
+    /// Full executable path (Win32 path; None for fast-skip / protected
+    /// processes). Populated by the full enumeration; the light fast scan
+    /// leaves it None. `#[serde(default)]` keeps the on-disk cache
+    /// backwards-compatible with records produced before this field was
+    /// added.
+    #[serde(default)]
+    pub exe_path: Option<String>,
     /// Process's current CPU affinity mask (None when unreadable, e.g.
     /// insufficient privileges). Transmitted as a hex string to avoid
     /// precision loss for large masks on the JS side.
@@ -94,6 +101,21 @@ pub struct ProcessInfo {
     pub parent_pid: u32,
     /// Whether access is denied (e.g. protected process).
     pub access_denied: bool,
+
+    // ---------- Process priorities (aligned with TypeScript ProcessInfo) ----------
+    /// CPU priority class raw value (0x40=Idle, 0x4000=BelowNormal,
+    /// 0x20=Normal, 0x8000=AboveNormal, 0x80=High, 0x100=Realtime); None
+    /// when unreadable. `#[serde(default)]` keeps the on-disk cache
+    /// backwards-compatible with records produced before this field was
+    /// added.
+    #[serde(default)]
+    pub priority_class: Option<u32>,
+    /// I/O priority (0=Very Low, 1=Low, 2=Normal); None when unreadable.
+    #[serde(default)]
+    pub io_priority: Option<u32>,
+    /// Memory priority (1=Very Low ... 5=Normal); None when unreadable.
+    #[serde(default)]
+    pub memory_priority: Option<u32>,
 
     // ---------- Resource usage metrics ----------
     /// Process CPU usage, 0.0 to (logical_processor_count * 100.0); normally

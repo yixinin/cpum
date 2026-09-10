@@ -20,14 +20,44 @@ const status = ref<PbStatus | null>(null);
 const logs = ref<PbLogEntry[]>([]);
 const statistics = ref<PbStatistics | null>(null);
 const loading = ref(false);
-const saving = ref(false);
 const errorMsg = ref<string | null>(null);
-const successMsg = ref<string | null>(null);
+/** True once the initial config load has populated `config`. The auto-save watcher
+ *  checks this to skip the load-induced assignment (otherwise every open would
+ *  immediately write the just-loaded data back to the backend). */
+const configLoaded = ref(false);
 
 /** Status polling handle (refreshes status + log every 2s while the panel is open) */
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 /** If the status file is older than this many seconds, the service is considered offline */
 const STATUS_FRESH_SECS = 5;
+/** Debounce window for auto-save: collapse rapid keystrokes / toggle clicks into
+ *  a single backend write (e.g. typing "1000" doesn't fire 4 IPC calls). */
+const AUTOSAVE_DEBOUNCE_MS = 400;
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ---------- Field metadata (drives the v-for in the template) ----------
+type NumericConfigKey = "fg_cpu_threshold" | "bg_cpu_threshold" | "sustain_secs" | "restore_after_secs" | "max_downgrade_secs";
+
+interface FieldSpec {
+  key: NumericConfigKey;
+  labelKey: string;
+  hintKey: string;
+  /** Unit shown as the v-text-field suffix (e.g. "%", "s") — the field labels intentionally drop this to stay short */
+  suffix: string;
+  min: number;
+  max: number;
+}
+
+const thresholdFields: FieldSpec[] = [
+  { key: "fg_cpu_threshold", labelKey: "pbFgThreshold", hintKey: "pbFgThresholdHint", suffix: "%", min: 10, max: 10000 },
+  { key: "bg_cpu_threshold", labelKey: "pbBgThreshold", hintKey: "pbBgThresholdHint", suffix: "%", min: 1, max: 10000 },
+];
+
+const timingFields: FieldSpec[] = [
+  { key: "sustain_secs", labelKey: "pbSustain", hintKey: "pbSustainHint", suffix: "s", min: 1, max: 600 },
+  { key: "restore_after_secs", labelKey: "pbRestoreAfter", hintKey: "pbRestoreAfterHint", suffix: "s", min: 1, max: 3600 },
+  { key: "max_downgrade_secs", labelKey: "pbMaxDowngrade", hintKey: "pbMaxDowngradeHint", suffix: "s", min: 30, max: 86400 },
+];
 
 // ---------- Derived engine state ----------
 
@@ -37,7 +67,7 @@ const serviceOnline = computed(() => {
   return Date.now() / 1000 - status.value.ts < STATUS_FRESH_SECS;
 });
 
-/** Engine runtime state: disabled / engaged / idle */
+/** Engine runtime state: disabled / engaged / idle / offline */
 const engineState = computed<"disabled" | "engaged" | "idle" | "offline">(() => {
   if (!status.value || !serviceOnline.value) return "offline";
   if (!status.value.enabled) return "disabled";
@@ -64,61 +94,60 @@ const engineStateLabel = computed(
     })[engineState.value],
 );
 
+/** Whether the live status detail line should render. Collapses to nothing when
+ *  the engine is idle/disabled/offline, so the header stays minimal. */
+const showStatusDetails = computed(
+  () =>
+    (status.value?.engaged && status.value.downgraded > 0) ||
+    (serviceOnline.value && status.value?.fg_pid) ||
+    !!status.value?.game_mode_active,
+);
+
 // ---------- Log display helpers ----------
 
 function actionLabel(action: string): string {
   switch (action) {
-    case "downgrade":
-      return t("pbActionDowngrade");
-    case "restore":
-      return t("pbActionRestore");
-    case "exit":
-      return t("pbActionExit");
-    case "game_mode_boost":
-      return t("pbActionGameBoost");
-    case "game_mode_restore":
-      return t("pbActionGameRestore");
-    default:
-      return action;
+    case "downgrade": return t("pbActionDowngrade");
+    case "restore": return t("pbActionRestore");
+    case "exit": return t("pbActionExit");
+    case "game_mode_boost": return t("pbActionGameBoost");
+    case "game_mode_restore": return t("pbActionGameRestore");
+    default: return action;
   }
 }
 
 function actionColor(action: string): string {
   switch (action) {
-    case "downgrade":
-      return "warning";
-    case "restore":
-      return "success";
-    default:
-      return "grey";
+    case "downgrade": return "warning";
+    case "restore": return "success";
+    default: return "grey";
   }
 }
 
 function reasonLabel(reason: string | null): string {
   switch (reason) {
-    case "contention_cleared":
-      return t("pbReasonContentionCleared");
-    case "timeout":
-      return t("pbReasonTimeout");
-    case "process_exited":
-      return t("pbReasonProcessExited");
-    case "disabled":
-      return t("pbReasonDisabled");
-    case "shutdown":
-      return t("pbReasonShutdown");
-    case "fullscreen_ended":
-      return t("pbReasonFullscreenEnded");
-    case "foreground_changed":
-      return t("pbReasonForegroundChanged");
-    case "startup_reconcile":
-      return t("pbReasonStartupReconcile");
-    default:
-      return "";
+    case "contention_cleared": return t("pbReasonContentionCleared");
+    case "timeout": return t("pbReasonTimeout");
+    case "process_exited": return t("pbReasonProcessExited");
+    case "disabled": return t("pbReasonDisabled");
+    case "shutdown": return t("pbReasonShutdown");
+    case "fullscreen_ended": return t("pbReasonFullscreenEnded");
+    case "foreground_changed": return t("pbReasonForegroundChanged");
+    case "startup_reconcile": return t("pbReasonStartupReconcile");
+    default: return "";
   }
 }
 
-/** Priority change summary: "Normal → Below Normal" (CPU tier shown, I/O appended) */
-function prioritySummary(entry: PbLogEntry): string {
+/** Compact priority change: just the CPU class ("Normal → Below Normal"). The full
+ *  breakdown (IO / memory) lives in `priorityFull` and is exposed via tooltip. */
+function priorityShort(entry: PbLogEntry): string {
+  const from = entry.from ? priorityClassLabel(entry.from.priority_class) : "";
+  const to = entry.to ? priorityClassLabel(entry.to.priority_class) : "";
+  if (!from && !to) return "-";
+  return `${from || "-"} → ${to || "-"}`;
+}
+
+function priorityFull(entry: PbLogEntry): string {
   const from = entry.from
     ? `${priorityClassLabel(entry.from.priority_class)} / IO ${ioPriorityLabel(entry.from.io_priority)}`
     : "";
@@ -141,6 +170,7 @@ async function loadConfig() {
   loading.value = true;
   try {
     config.value = await getProBalanceConfig();
+    configLoaded.value = true;
     errorMsg.value = null;
   } catch (e) {
     errorMsg.value = t("pbLoadFailed", { error: String(e) });
@@ -181,16 +211,54 @@ async function save() {
     errorMsg.value = problem;
     return;
   }
-  saving.value = true;
   try {
     await saveProBalanceConfig(config.value);
-    successMsg.value = t("pbSaved");
     errorMsg.value = null;
-    setTimeout(() => (successMsg.value = null), 3000);
   } catch (e) {
     errorMsg.value = t("pbSaveFailed", { error: String(e) });
-  } finally {
-    saving.value = false;
+  }
+}
+
+/** Auto-save: any field change writes the whole config back after a short
+ *  debounce. The backend hot-reloads within ~1s, so the change is effectively
+ *  immediate from the user's perspective. */
+function scheduleAutoSave() {
+  if (saveTimer !== null) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    void save();
+  }, AUTOSAVE_DEBOUNCE_MS);
+}
+
+/** Run a pending auto-save synchronously (used when the dialog closes so the
+ *  last edit isn't dropped if the debounce window hasn't elapsed). */
+function flushPendingSave() {
+  if (saveTimer !== null) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    void save();
+  }
+}
+
+// Watch every config field; deep: true because threshold values are nested
+// inside the `config` ref. The `configLoaded` guard suppresses the assignment
+// from `loadConfig`, which would otherwise re-save the just-loaded data.
+watch(
+  config,
+  () => {
+    if (!configLoaded.value) return;
+    scheduleAutoSave();
+  },
+  { deep: true },
+);
+
+/** Apply a number-input change to a specific config field. v-text-field with type=number
+ *  emits either a number or an empty string, so we normalize before assigning. */
+function setNumericField(key: NumericConfigKey, value: number | string) {
+  if (!config.value) return;
+  const n = typeof value === "number" ? value : Number(value);
+  if (Number.isFinite(n)) {
+    (config.value as unknown as Record<NumericConfigKey, number>)[key] = n;
   }
 }
 
@@ -205,17 +273,21 @@ function stopPolling() {
     clearInterval(pollTimer);
     pollTimer = null;
   }
+  // Flush any pending auto-save so the user's last edit isn't lost on close.
+  flushPendingSave();
 }
 
 watch(
   () => props.modelValue,
   (open) => {
     if (open) {
+      // Reset the loaded-flag for the new session so the loadConfig assignment
+      // doesn't re-trigger a save.
+      configLoaded.value = false;
       loadConfig();
       startPolling();
     } else {
       stopPolling();
-      successMsg.value = null;
       errorMsg.value = null;
     }
   },
@@ -223,6 +295,7 @@ watch(
 
 onMounted(() => {
   if (props.modelValue) {
+    configLoaded.value = false;
     loadConfig();
     startPolling();
   }
@@ -235,180 +308,165 @@ onUnmounted(stopPolling);
   <v-dialog
     :model-value="modelValue"
     @update:model-value="emit('update:modelValue', $event)"
-    max-width="860"
+    max-width="800"
   >
     <v-card>
-      <v-card-title class="d-flex align-center">
+      <v-card-title class="d-flex align-center pa-3 pb-2">
         <v-icon icon="mdi-tune-vertical" class="mr-2" color="primary" />
-        {{ t('pbTitle') }}
+        <span class="text-h6">{{ t('pbTitle') }}</span>
+        <!-- Engine state chip lives next to the title (not in its own card row) -->
+        <v-chip
+          :color="engineStateColor"
+          size="x-small"
+          variant="flat"
+          class="ml-3 font-weight-medium"
+        >
+          <v-icon start size="x-small" :icon="engineState === 'engaged' ? 'mdi-fire' : 'mdi-circle-small'" />
+          {{ engineStateLabel }}
+        </v-chip>
         <v-spacer />
-        <v-btn icon="mdi-close" variant="text" @click="emit('update:modelValue', false)" />
+        <v-btn icon="mdi-close" variant="text" density="compact" @click="emit('update:modelValue', false)" />
       </v-card-title>
+      <div class="px-4 pb-2 text-body-2 text-medium-emphasis">{{ t('pbSubtitle') }}</div>
+      <!-- Live status line — only shown when there's actual data to convey
+           (downgraded count, foreground info, or game-mode active). When the
+           engine is idle/disabled/offline this whole row collapses out. -->
+      <div
+        v-if="showStatusDetails"
+        class="px-4 pb-2 text-caption text-medium-emphasis d-flex align-center ga-3 flex-wrap"
+      >
+        <span v-if="status?.engaged && status.downgraded > 0">
+          {{ t('pbDowngradedCount', { count: status.downgraded }) }}
+        </span>
+        <span v-if="serviceOnline && status?.fg_pid">
+          {{ t('pbFgInfo', { pid: status.fg_pid, cpu: (status.fg_cpu_percent ?? 0).toFixed(0) }) }}
+        </span>
+        <v-spacer />
+        <v-chip v-if="status?.game_mode_active" color="primary" size="x-small" variant="tonal">
+          <v-icon start icon="mdi-gamepad-variant" size="x-small" />
+          {{ t('pbGameModeActive') }}
+        </v-chip>
+      </div>
 
-      <v-card-text style="max-height: 70vh; overflow-y: auto">
-        <!-- Description -->
-        <v-alert type="info" density="compact" variant="tonal" class="mb-4">
-          {{ t('pbDesc') }}
-        </v-alert>
+      <v-divider />
 
-        <v-alert v-if="errorMsg" type="error" density="compact" class="mb-3" closable @click:close="errorMsg = null">
-          {{ errorMsg }}
-        </v-alert>
-        <v-alert v-if="successMsg" type="success" density="compact" class="mb-3">
-          {{ successMsg }}
-        </v-alert>
+      <v-card-text class="pa-4" style="max-height: 72vh; overflow-y: auto">
+        <!-- Error banner only — auto-save is silent on success -->
+        <v-alert v-if="errorMsg" type="error" density="compact" variant="tonal" class="mb-3"
+          closable @click:close="errorMsg = null">{{ errorMsg }}</v-alert>
 
-        <!-- Engine status -->
-        <div class="d-flex align-center flex-wrap gap-2 mb-4">
-          <span class="text-subtitle-2">{{ t('pbStatusTitle') }}:</span>
-          <v-chip :color="engineStateColor" size="small" variant="flat">
-            <v-icon start :icon="engineState === 'engaged' ? 'mdi-fire' : 'mdi-circle-small'" />
-            {{ engineStateLabel }}
-          </v-chip>
-          <v-chip
-            v-if="engineState === 'engaged' && status"
-            color="warning"
-            size="small"
-            variant="outlined"
-          >
-            {{ t('pbDowngradedCount', { count: status.downgraded }) }}
-          </v-chip>
-          <v-chip
-            v-if="engineState !== 'offline' && status?.fg_pid"
-            size="small"
-            variant="outlined"
-          >
-            {{ t('pbFgInfo', { pid: status.fg_pid, cpu: (status.fg_cpu_percent ?? 0).toFixed(0) }) }}
-          </v-chip>
-          <v-chip v-if="status?.game_mode_active" color="primary" size="small" variant="outlined">
-            {{ t('pbGameModeActive') }}
-          </v-chip>
-          <v-chip v-if="!status" size="small" variant="outlined" color="grey">
-            {{ t('pbNoStatus') }}
-          </v-chip>
-        </div>
-
-        <v-divider class="mb-4" />
-
-        <!-- Config editor -->
         <template v-if="config">
-          <v-progress-linear v-if="loading" indeterminate color="primary" class="mb-2" />
+          <v-progress-linear v-if="loading" indeterminate color="primary" class="mb-3" />
 
-          <!-- Master switch -->
-          <v-switch
-            v-model="config.enabled"
-            :label="t('pbEnable')"
-            color="primary"
-            hide-details
-            class="mb-2"
-          />
+          <!-- Master toggles -->
+          <v-switch v-model="config.enabled" :label="t('pbEnable')" color="primary"
+            hide-details density="compact" class="mb-1" />
+          <v-switch v-model="config.game_mode_enabled" color="primary"
+            hide-details density="compact" class="mb-3">
+            <template #label>
+              <span>{{ t('pbGameMode') }}</span>
+              <v-tooltip :text="t('pbGameModeHint')" location="top">
+                <template #activator="{ props }">
+                  <v-icon v-bind="props" icon="mdi-help-circle-outline" size="x-small"
+                    color="grey-darken-1" class="ml-1" />
+                </template>
+              </v-tooltip>
+            </template>
+          </v-switch>
 
-          <v-switch
-            v-model="config.game_mode_enabled"
-            :label="t('pbGameMode')"
-            :hint="t('pbGameModeHint')"
-            persistent-hint
-            color="primary"
-            class="mb-2"
-          />
+          <v-divider class="mb-3" />
 
-          <!-- Threshold parameters -->
+          <!-- Triggers -->
+          <div class="section-title text-subtitle-2 text-medium-emphasis mb-2">
+            {{ t('pbSectionTriggers') }}
+          </div>
           <v-row dense>
-            <v-col cols="12" sm="6">
+            <v-col v-for="f in thresholdFields" :key="f.key" cols="12" sm="6">
               <v-text-field
-                v-model.number="config.fg_cpu_threshold"
-                :label="t('pbFgThreshold')"
-                :hint="t('pbFgThresholdHint')"
-                persistent-hint
+                :model-value="config[f.key]"
+                @update:model-value="(v) => setNumericField(f.key, v)"
+                :label="t(f.labelKey)"
+                :suffix="f.suffix"
                 type="number"
-                min="10"
-                max="10000"
-                density="compact"
-              />
+                :min="f.min" :max="f.max"
+                density="compact" variant="outlined" hide-details
+              >
+                <template #append-inner>
+                  <v-tooltip :text="t(f.hintKey)" location="top">
+                    <template #activator="{ props }">
+                      <v-icon v-bind="props" icon="mdi-help-circle-outline" size="small"
+                        color="grey-darken-1" />
+                    </template>
+                  </v-tooltip>
+                </template>
+              </v-text-field>
             </v-col>
-            <v-col cols="12" sm="6">
+          </v-row>
+
+          <!-- Timing -->
+          <div class="section-title text-subtitle-2 text-medium-emphasis mb-2 mt-3">
+            {{ t('pbSectionTiming') }}
+          </div>
+          <v-row dense>
+            <v-col v-for="f in timingFields" :key="f.key" cols="12" sm="4">
               <v-text-field
-                v-model.number="config.bg_cpu_threshold"
-                :label="t('pbBgThreshold')"
-                :hint="t('pbBgThresholdHint')"
-                persistent-hint
+                :model-value="config[f.key]"
+                @update:model-value="(v) => setNumericField(f.key, v)"
+                :label="t(f.labelKey)"
+                :suffix="f.suffix"
                 type="number"
-                min="1"
-                max="10000"
-                density="compact"
-              />
-            </v-col>
-            <v-col cols="12" sm="4">
-              <v-text-field
-                v-model.number="config.sustain_secs"
-                :label="t('pbSustain')"
-                :hint="t('pbSustainHint')"
-                persistent-hint
-                type="number"
-                min="1"
-                max="600"
-                density="compact"
-              />
-            </v-col>
-            <v-col cols="12" sm="4">
-              <v-text-field
-                v-model.number="config.restore_after_secs"
-                :label="t('pbRestoreAfter')"
-                :hint="t('pbRestoreAfterHint')"
-                persistent-hint
-                type="number"
-                min="1"
-                max="3600"
-                density="compact"
-              />
-            </v-col>
-            <v-col cols="12" sm="4">
-              <v-text-field
-                v-model.number="config.max_downgrade_secs"
-                :label="t('pbMaxDowngrade')"
-                :hint="t('pbMaxDowngradeHint')"
-                persistent-hint
-                type="number"
-                min="30"
-                max="86400"
-                density="compact"
-              />
+                :min="f.min" :max="f.max"
+                density="compact" variant="outlined" hide-details
+              >
+                <template #append-inner>
+                  <v-tooltip :text="t(f.hintKey)" location="top">
+                    <template #activator="{ props }">
+                      <v-icon v-bind="props" icon="mdi-help-circle-outline" size="small"
+                        color="grey-darken-1" />
+                    </template>
+                  </v-tooltip>
+                </template>
+              </v-text-field>
             </v-col>
           </v-row>
 
           <!-- Allowlist -->
-          <v-combobox
-            v-model="config.whitelist"
-            :label="t('pbWhitelist')"
-            :hint="t('pbWhitelistHint')"
-            persistent-hint
-            :placeholder="t('pbWhitelistPlaceholder')"
-            multiple
-            chips
-            closable-chips
-            deletable-chips
-            density="compact"
-            class="mt-2"
-          />
-
-          <!-- Save -->
-          <div class="d-flex justify-end mt-2 mb-4">
-            <v-btn color="primary" prepend-icon="mdi-content-save" :loading="saving" @click="save">
-              {{ t('save') }}
-            </v-btn>
+          <div class="section-title text-subtitle-2 text-medium-emphasis mb-2 mt-3">
+            {{ t('pbSectionAllowlist') }}
           </div>
+          <v-combobox v-model="config.whitelist"
+            :placeholder="t('pbWhitelistPlaceholder')"
+            multiple chips closable-chips deletable-chips
+            density="compact" variant="outlined" hide-details
+          >
+            <template #prepend-inner>
+              <v-tooltip :text="t('pbWhitelistHint')" location="top">
+                <template #activator="{ props }">
+                  <v-icon v-bind="props" icon="mdi-help-circle-outline" size="small"
+                    color="grey-darken-1" />
+                </template>
+              </v-tooltip>
+            </template>
+          </v-combobox>
         </template>
 
-        <v-divider class="mb-3" />
+        <v-divider class="my-4" />
 
-        <div v-if="statistics" class="d-flex flex-wrap ga-2 mb-3">
-          <v-chip size="small" variant="tonal">{{ t('pbStatsDowngrades', { count: statistics.downgrade_count }) }}</v-chip>
-          <v-chip size="small" variant="tonal">{{ t('pbStatsRestores', { count: statistics.restore_count }) }}</v-chip>
-          <v-chip size="small" variant="tonal">{{ t('pbStatsProcesses', { count: statistics.unique_processes }) }}</v-chip>
+        <!-- Activity: stats inline with the section title, log table below -->
+        <div class="d-flex align-center flex-wrap ga-2 mb-2">
+          <span class="text-subtitle-2">{{ t('pbLogTitle') }}</span>
+          <template v-if="statistics">
+            <v-chip size="x-small" variant="tonal" color="warning">
+              {{ t('pbStatsDowngrades', { count: statistics.downgrade_count }) }}
+            </v-chip>
+            <v-chip size="x-small" variant="tonal" color="success">
+              {{ t('pbStatsRestores', { count: statistics.restore_count }) }}
+            </v-chip>
+            <v-chip size="x-small" variant="tonal">
+              {{ t('pbStatsProcesses', { count: statistics.unique_processes }) }}
+            </v-chip>
+          </template>
         </div>
-
-        <!-- Action log -->
-        <div class="text-subtitle-2 mb-2">{{ t('pbLogTitle') }}</div>
         <v-table v-if="logs.length > 0" density="compact" class="log-table">
           <thead>
             <tr>
@@ -430,14 +488,24 @@ onUnmounted(stopPolling);
               </td>
               <td class="text-no-wrap">{{ log.name }} ({{ log.pid }})</td>
               <td>{{ log.cpu !== null ? `${log.cpu.toFixed(0)}%` : '-' }}</td>
-              <td class="text-no-wrap" style="max-width: 260px; overflow: hidden; text-overflow: ellipsis">
-                {{ prioritySummary(log) }}
+              <td class="text-no-wrap">
+                <v-tooltip
+                  :text="priorityFull(log)"
+                  location="top"
+                  :disabled="priorityShort(log) === '-'"
+                >
+                  <template #activator="{ props }">
+                    <span v-bind="props" class="text-caption">{{ priorityShort(log) }}</span>
+                  </template>
+                </v-tooltip>
               </td>
-              <td class="pr-0">{{ reasonLabel(log.reason) }}</td>
+              <td class="pr-0 text-caption">{{ reasonLabel(log.reason) }}</td>
             </tr>
           </tbody>
         </v-table>
-        <div v-else class="text-body-2 text-medium-emphasis">{{ t('pbLogEmpty') }}</div>
+        <div v-else class="text-body-2 text-medium-emphasis text-center py-4">
+          {{ t('pbLogEmpty') }}
+        </div>
       </v-card-text>
     </v-card>
   </v-dialog>
@@ -447,5 +515,8 @@ onUnmounted(stopPolling);
 .log-table :deep(th),
 .log-table :deep(td) {
   white-space: nowrap;
+}
+.section-title {
+  letter-spacing: 0.02em;
 }
 </style>

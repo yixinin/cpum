@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
 import type { ProcessInfo, CpuScaleMode } from "./types";
 import { refreshDisplayCache, formatMemory, priorityClassLabel, ioPriorityLabel, memoryPriorityLabel, priorityClassColor } from "./types";
-import { getServiceStatus, getProcessExePath, getLogicalProcessorUsage, installService, uninstallService, startService, stopService, type ServiceStatus } from "./api";
+import { getServiceStatus, getProcessExePath, getLogicalProcessorUsage, installService, uninstallService, startService, stopService, type ServiceStatus, type AffinityRule } from "./api";
 import type { LogicalProcessorUsage } from "./types";
 import type { SortItem, ViewMode } from "./constants";
 import { useTopology } from "./composables/useTopology";
@@ -61,9 +61,86 @@ async function refreshLogicalProcessorUsage() {
   try { logicalProcessorUsage.value = await getLogicalProcessorUsage(); } catch { /* unsupported or transient failure */ }
 }
 
-// Affinity editor
+// CPU core usage card: keep each visible row's core count as even as
+// possible. Pick the fewest rows R such that ceil(total / R) still fits
+// the available width; per-row count is then derived from R so the
+// remainder lands in a single (last) row instead of being scattered.
+// Without this, the naive "pack as many per row as fit" approach
+// produces uneven splits (e.g. 14 cores on a 8-col row -> 8 / 6).
+const cpuCoresCardRef = ref<HTMLElement | null>(null);
+const coresPerRow = ref(16);
+let coresResizeObserver: ResizeObserver | null = null;
+
+// Per .core-usage cell width (54px from styles + 8px ga-2 gap). Subtract
+// the card's pa-2 padding (8px each side) before dividing.
+const CORE_CELL_PITCH = 62;
+const CORE_CARD_PADDING = 16;
+
+function updateCoresPerRow() {
+  const el = cpuCoresCardRef.value as HTMLElement | null;
+  if (!el) return;
+  // Defensive: refs on Vuetify components resolve to component instances
+  // rather than DOM elements; fall back to a sensible default rather than
+  // letting NaN propagate into coreRows (which would yield an empty slice
+  // and hide every core).
+  const cardWidth = el.clientWidth;
+  if (typeof cardWidth !== "number" || !Number.isFinite(cardWidth) || cardWidth <= 0) return;
+  const available = Math.max(0, cardWidth - CORE_CARD_PADDING);
+  const total = logicalProcessorUsage.value.length;
+  if (total <= 0) {
+    coresPerRow.value = 0;
+    return;
+  }
+  const maxCols = Math.max(1, Math.floor(available / CORE_CELL_PITCH));
+  // Smallest row count R such that ceil(total / R) <= maxCols. Per-row
+  // count = ceil(total / R); chunking then gives rows of that size, with
+  // the last row carrying the (total % cols) remainder.
+  let bestR = total;
+  for (let r = 1; r <= total; r++) {
+    if (Math.ceil(total / r) <= maxCols) {
+      bestR = r;
+      break;
+    }
+  }
+  coresPerRow.value = Math.ceil(total / bestR);
+}
+
+const coreRows = computed<LogicalProcessorUsage[][]>(() => {
+  const arr = logicalProcessorUsage.value;
+  if (arr.length === 0) return [];
+  const cols = Math.max(1, coresPerRow.value);
+  const rows: LogicalProcessorUsage[][] = [];
+  for (let i = 0; i < arr.length; i += cols) {
+    rows.push(arr.slice(i, i + cols));
+  }
+  return rows;
+});
+
+// Watch the ref so the observer is re-attached if the v-card is
+// unmounted/remounted (v-if gates the card on data availability).
+watch(cpuCoresCardRef, (el, _prev, onCleanup) => {
+  coresResizeObserver?.disconnect();
+  coresResizeObserver = null;
+  if (!el) return;
+  nextTick(() => updateCoresPerRow());
+  if (typeof ResizeObserver !== "undefined") {
+    coresResizeObserver = new ResizeObserver(() => updateCoresPerRow());
+    coresResizeObserver.observe(el);
+  }
+  onCleanup(() => {
+    coresResizeObserver?.disconnect();
+    coresResizeObserver = null;
+  });
+});
+
+// Affinity editor — driven by a discriminated-union `target` so the same
+// component powers both the process-list right-click "Edit Rule" and the
+// rule manager's Add / Edit actions (target.kind switches the behavior).
+type EditorTarget =
+  | { kind: "process"; process: ProcessInfo }
+  | { kind: "rule"; rule: AffinityRule; isNew: boolean };
 const editorOpen = ref(false);
-const editingProcess = ref<ProcessInfo | null>(null);
+const editorTarget = ref<EditorTarget | null>(null);
 
 // Rule manager
 const ruleManagerOpen = ref(false);
@@ -99,14 +176,6 @@ const dieGroupLabel = computed(() => {
 const streaming = metricsStream.streaming;
 const toggleStreamingBusy = metricsStream.toggleBusy;
 const toggleStreaming = metricsStream.toggle;
-const cpuHistory = metricsStream.cpuHistory;
-
-function cpuSparkline(pid: number): string {
-  const values = cpuHistory(pid);
-  if (values.length < 2) return "";
-  const peak = Math.max(1, ...values);
-  return values.map((value, index) => `${(index / (values.length - 1)) * 58},${18 - (value / peak) * 16}`).join(" ");
-}
 
 const processCount = computed(() => processes.value.filter(p => !p.access_denied).length);
 
@@ -152,7 +221,7 @@ function rebuildProcessesByPid() {
 }
 
 function openEditor(p: ProcessInfo) {
-  editingProcess.value = p;
+  editorTarget.value = { kind: "process", process: p };
   editorOpen.value = true;
 }
 
@@ -318,6 +387,8 @@ onUnmounted(() => {
   window.removeEventListener("resize", updateTableHeight);
   metricsStream.unregister();
   if (coreUsageTimer) clearInterval(coreUsageTimer);
+  coresResizeObserver?.disconnect();
+  coresResizeObserver = null;
 });
 // ---------- Service Management ----------
 const serviceStatusText = computed(() => {
@@ -518,15 +589,17 @@ async function doStopService() {
         <!-- Loading bar -->
         <v-progress-linear v-if="loading && !processes.length" indeterminate color="primary" class="mb-2" />
 
-        <v-card v-if="logicalProcessorUsage.length" variant="outlined" class="mb-2 pa-2">
-          <div class="text-caption text-medium-emphasis mb-1">{{ t('cpu') }}</div>
-          <div class="d-flex flex-wrap ga-2">
-            <div v-for="usage in logicalProcessorUsage" :key="usage.index" class="core-usage">
-              <span>{{ usage.index }}</span>
-              <v-progress-linear :model-value="usage.usage_percent" height="5" rounded color="primary" />
+        <div ref="cpuCoresCardRef">
+          <v-card v-if="logicalProcessorUsage.length" variant="outlined" class="mb-2 pa-2">
+            <div class="text-caption text-medium-emphasis mb-1">{{ t('cpu') }}</div>
+            <div v-for="(row, ri) in coreRows" :key="ri" class="d-flex ga-2 mb-1">
+              <div v-for="usage in row" :key="usage.index" class="core-usage">
+                <span>{{ usage.index }}</span>
+                <v-progress-linear :model-value="usage.usage_percent" height="5" rounded color="primary" />
+              </div>
             </div>
-          </div>
-        </v-card>
+          </v-card>
+        </div>
 
         <!-- Process Table -->
         <div ref="tableCardRef">
@@ -535,7 +608,6 @@ async function doStopService() {
               { title: 'PID', key: 'pid', sortable: true, width: '70px', minWidth: '70px' },
               { title: viewMode === 'tree' ? t('nameTree') : t('name'), key: 'name', sortable: true, width: '200px', minWidth: '150px' },
               { title: t('cpu'), key: 'cpu_usage_percent', sortable: true, width: '80px', minWidth: '80px', align: 'end' },
-              { title: 'CPU', key: 'cpu_history', sortable: false, width: '70px', minWidth: '70px', align: 'center' },
               { title: t('memory'), key: 'memory_bytes', sortable: true, width: '100px', minWidth: '100px', align: 'end' },
               { title: t('priority'), key: 'priority_class', sortable: true, width: '110px', minWidth: '110px' },
               { title: t('affinity'), key: 'affinity', sortable: false, width: '150px', minWidth: '140px' },
@@ -575,13 +647,6 @@ async function doStopService() {
                 <span class="text-body-2 font-weight-medium" :style="{ color: item._display.cpu_color }">
                   {{ item._display.cpu_text }}
                 </span>
-              </template>
-
-              <template #item.cpu_history="{ item }">
-                <svg v-if="cpuSparkline(item.pid)" width="60" height="20" viewBox="0 0 60 20" role="img" :aria-label="t('cpu')">
-                  <polyline :points="cpuSparkline(item.pid)" fill="none" :stroke="item._display.cpu_color" stroke-width="1.5" />
-                </svg>
-                <span v-else class="text-medium-emphasis">-</span>
               </template>
 
               <!-- Memory -->
@@ -631,7 +696,7 @@ async function doStopService() {
     </v-main>
 
     <!-- Affinity Editor Dialog -->
-    <AffinityEditor v-model="editorOpen" :process="editingProcess" :topology="topology" @applied="onApplied" />
+    <AffinityEditor v-model="editorOpen" :target="editorTarget" :topology="topology" @applied="onApplied" />
 
     <!-- Affinity Rule Manager Dialog -->
     <AffinityRuleManager v-model="ruleManagerOpen" :topology="topology" @applied="onRulesApplied" />

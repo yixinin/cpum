@@ -17,6 +17,11 @@
 //! Coordination with the rule engine: enabled rules that manage priorities
 //! form a "protected list"; matching processes are skipped by ProBalance to
 //! avoid the two engines clobbering each other's priority settings.
+//!
+//! This crate is intentionally separate from the main `cpum` GUI crate so
+//! that `tauri_build::try_build` does not run its build script (and therefore
+//! does not validate the bundled `cpum_service.exe` resource) when only the
+//! service binary is being compiled.
 
 use std::ffi::OsString;
 use std::time::Duration;

@@ -13,7 +13,7 @@ if errorlevel 1 goto :failed
 
 echo [3/4] Building Windows service...
 pushd src-tauri
-cargo build --release --bin cpum_service
+cargo build --release -p cpum-service --bin cpum_service
 if errorlevel 1 (
   popd
   goto :failed

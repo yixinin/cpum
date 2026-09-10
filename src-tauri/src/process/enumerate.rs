@@ -272,6 +272,7 @@ pub fn list_processes_light() -> Result<Vec<ProcessInfo>, String> {
         out.push(ProcessInfo {
             pid: r.pid,
             name: r.name,
+            exe_path: None, // Light scan skips OpenProcess, so no exe path.
             affinity_mask: None,
             system_affinity_mask: None,
             group_affinity_masks: None,
@@ -279,6 +280,11 @@ pub fn list_processes_light() -> Result<Vec<ProcessInfo>, String> {
             parent_pid: r.parent_pid,
             access_denied: false, // Unknown: assume we have access; the full
                                   // enumeration patch will overwrite.
+            priority_class: None, // Light scan does not read priorities; the
+                                  // full enumeration / metrics diff will
+                                  // backfill these.
+            io_priority: None,
+            memory_priority: None,
             cpu_usage_percent: 0.0,
             memory_bytes: 0,
             disk_read_bps: 0,
@@ -382,12 +388,16 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, String> {
         out.push(ProcessInfo {
             pid: pb.pid,
             name: pb.name,
+            exe_path: pb.exe_path,
             affinity_mask: pb.affinity_mask,
             system_affinity_mask: pb.system_affinity_mask,
             group_affinity_masks: pb.group_affinity_masks,
             group_system_affinity_masks: pb.group_system_affinity_masks,
             parent_pid: pb.parent_pid,
             access_denied: pb.access_denied,
+            priority_class: pb.priorities.priority_class,
+            io_priority: pb.priorities.io_priority,
+            memory_priority: pb.priorities.memory_priority,
             cpu_usage_percent: rs.cpu_percent,
             memory_bytes: pb.memory_bytes,
             disk_read_bps: rs.disk_read_bps,
