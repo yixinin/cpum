@@ -1,0 +1,48 @@
+[package]
+name = "cpum"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["eason"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# Rule model / matching / persistence / Win32 write operations are extracted
+# into cpum-core, which both the GUI (this crate) and the Windows service
+# (crates/cpum-service) depend on. The service is a separate workspace member
+# crate so that the Tauri build script of this crate does not run when only
+# the service binary is being compiled (which would otherwise panic on a
+# `target/release/cpum_service.exe` resource check that has not yet produced
+# the artifact - a chicken-and-egg when both binaries live in one crate).
+[workspace]
+members = ["crates/cpum-core", "crates/cpum-service"]
+resolver = "2"
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This is only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "cpum_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "cpum"
+path = "src/main.rs"
+# The desktop executable embeds a requireAdministrator manifest and contains
+# no unit tests. Running its generated test harness fails with Windows 740.
+test = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+winres = "0.1"
+
+[dependencies]
+cpum-core = { path = "crates/cpum-core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+once_cell = "1"
+uuid = { version = "1", features = ["v4"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_System_LibraryLoader", "Win32_System_WindowsProgramming", "Wdk_System_SystemInformation"] }
+windows-service = "0.7"

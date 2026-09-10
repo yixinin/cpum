@@ -1,0 +1,5 @@
+// Vuetify config file (consumed by vite-plugin-vuetify to inject SASS variables).
+// Leave empty to use the defaults. Override $utilities, etc. here if needed.
+@use 'vuetify/settings' with (
+  $color-pack: false
+);
