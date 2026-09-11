@@ -151,6 +151,15 @@ For a one-time diagnostic application of the rules, run the installed service ex
 & "<path-to-cpum_service.exe>" --apply-once C:\ProgramData\cpum
 ```
 
+## Auto-update and release signing
+
+Releases are published as signed updater artifacts. The Tauri updater plugin
+is wired up in the desktop binary; the GitHub Actions release pipeline emits
+the signed `.nsis.zip` archives, the matching minisign signatures, a
+multi-architecture `latest.json` manifest, and a `SHA256SUMS.txt` file with
+the SHA-256 of every released file. Key generation, CI secrets, and
+verification instructions live in [docs/UPDATER.md](docs/UPDATER.md).
+
 ## Project layout
 
 ```text
@@ -169,6 +178,9 @@ src-tauri/                        Tauri desktop binary
     cpum-core/                    Rule model, matcher, store, ProBalance, procwin
     cpum-service/                 cpum_service.exe (Windows service + ProBalance runtime)
   installer-hooks.nsh             NSIS hooks: migrate legacy rule files to %ProgramData%
+  tauri.pubkey                    Committed updater public key (private key is gitignored)
+docs/
+  UPDATER.md                      Key management, release artifacts, verification
 build.bat                         NSIS release build script
 ```
 

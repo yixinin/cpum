@@ -474,6 +474,13 @@
   dependencies:
     "@tauri-apps/api" "^2.11.0"
 
+"@tauri-apps/plugin-updater@^2":
+  version "2.11.0"
+  resolved "https://registry.npmmirror.com/@tauri-apps/plugin-updater/-/plugin-updater-2.11.0.tgz"
+  integrity sha512-AE36XkOoSna24G40jZMY15nzAnkXEPL/73tGoseGrtGOHuI/cZwWzHpZFLjKXDPgzYZ435z1gHu28LgrsBwIxQ==
+  dependencies:
+    "@tauri-apps/api" "^2.11.0"
+
 "@types/estree@1.0.9":
   version "1.0.9"
   resolved "https://registry.npmmirror.com/@types/estree/-/estree-1.0.9.tgz"
