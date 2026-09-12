@@ -116,6 +116,13 @@ jobs:
         run: npx tauri build --bundles nsis --target ${{ matrix.target }}
 
       - name: Prepare installer artifact
+        # Carry the signing env vars forward so the PowerShell block below
+        # can distinguish between "secret not configured" and "secret set
+        # but tauri build silently skipped signing" (the latter is almost
+        # always a wrong / missing TAURI_SIGNING_PRIVATE_KEY_PASSWORD).
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         shell: pwsh
         run: |
           # Tauri writes Windows bundle output to its configured target directory,
@@ -126,10 +133,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path 'release-artifact/installer' | Out-Null
           Copy-Item $installer.FullName "release-artifact/installer/CPU-Manager_${{ github.ref_name }}_windows-${{ matrix.architecture }}-setup.exe"
 
-          # Collect updater artifacts produced only when
-          # TAURI_SIGNING_PRIVATE_KEY is configured. The release job combines
-          # the per-architecture `latest.json` into a single manifest, so we
-          # stash each one under its own directory.
+          # Collect updater artifacts. Their presence depends on a chain of
+          # preconditions in `tauri build`; an empty glob is not a diagnosis,
+          # so report exactly which link in the chain is broken.
           $updater = @(
             Get-ChildItem $bundleDir -Filter '*.nsis.zip' -ErrorAction SilentlyContinue
             Get-ChildItem $bundleDir -Filter '*.nsis.zip.sig' -ErrorAction SilentlyContinue
@@ -139,12 +145,23 @@ jobs:
           if ($updater.Count -gt 0) {
             New-Item -ItemType Directory -Force -Path "release-artifact/updater-${{ matrix.architecture }}" | Out-Null
             $updater | Copy-Item -Destination "release-artifact/updater-${{ matrix.architecture }}/"
-            # The exe and its .sig are part of the updater artifacts too (for
-            # the rare client that prefers the full installer), but we only
-            # need them if they were produced.
             Write-Host "Collected $($updater.Count) updater artifact(s) for ${{ matrix.architecture }}."
           } else {
-            Write-Host "No updater artifacts for ${{ matrix.architecture }} (TAURI_SIGNING_PRIVATE_KEY not set)."
+            # No updater files on disk. Diagnose which precondition is missing
+            # so the user does not have to guess between secret, password, or
+            # pubkey mismatch.
+            $keySet       = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)
+            $passwordSet  = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
+            $pubkeyInConf = -not [string]::IsNullOrEmpty(((Get-Content 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json).plugins.updater.pubkey))
+            $reasons = New-Object System.Collections.Generic.List[string]
+            if (-not $keySet)      { $reasons.Add('TAURI_SIGNING_PRIVATE_KEY secret is empty (set it in repo Settings > Secrets and variables > Actions)') }
+            if ($keySet -and -not $passwordSet) { $reasons.Add('TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is empty or unset (the Tauri keystore is encrypted; a non-empty password is required because GitHub does not allow empty secrets)') }
+            if ($keySet -and $passwordSet -and -not $pubkeyInConf) { $reasons.Add('plugins.updater.pubkey in src-tauri/tauri.conf.json is empty') }
+            if ($reasons.Count -eq 0) {
+              $reasons.Add('tauri build did not produce updater artifacts even though the env vars are set; most likely the password is wrong, or the pubkey in tauri.conf.json does not match the private key. Re-run with ACTIONS_STEP_DEBUG=true to see the bundler warning.')
+            }
+            Write-Host "::warning::No updater artifacts for ${{ matrix.architecture }}. Likely cause(s):"
+            foreach ($r in $reasons) { Write-Host "::warning::  - $r" }
           }
 
       - name: Upload installer

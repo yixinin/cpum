@@ -58,8 +58,11 @@ and publishes only the installers.
 When the private key is set but the password is wrong or missing, the
 Tauri bundler cannot decrypt the keystore and silently skips signing
 without failing the build - the symptom looks identical to "secret not
-configured". The "No updater artifacts" line in the build log is the
-canonical signal. Always set both secrets.
+configured". The build job's `Prepare installer artifact` step now emits
+a `::warning::` annotation with the specific precondition that failed
+(check the env var presence, the password presence, and the pubkey in
+`tauri.conf.json`); always read that warning before assuming the secret
+itself is misconfigured.
 
 To set the secrets:
 
