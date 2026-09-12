@@ -8,6 +8,8 @@ const messages: Record<Locale, Record<string, string>> = {
   "zh-CN": {
     // ---------- Common ----------
     appTitle: "CPU Manager",
+    appVersion: "版本 {version}",
+    unknownVersion: "未知",
     language: "English",
     themeLight: "切换亮色主题",
     themeDark: "切换暗色主题",
@@ -266,6 +268,8 @@ const messages: Record<Locale, Record<string, string>> = {
   "en-US": {
     // ---------- Common ----------
     appTitle: "CPU Manager",
+    appVersion: "Version {version}",
+    unknownVersion: "Unknown",
     language: "中文",
     themeLight: "Switch to light theme",
     themeDark: "Switch to dark theme",

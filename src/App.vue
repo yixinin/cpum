@@ -15,9 +15,12 @@ import ProBalancePanel from "./components/ProBalancePanel.vue";
 import { useI18n } from "./i18n";
 import { useTheme } from "./composables/useTheme";
 import { check, type Update } from "@tauri-apps/plugin-updater";
+import { getVersion } from "@tauri-apps/api/app";
 const { t, toggleLocale } = useI18n();
 const { theme, toggleTheme } = useTheme();
 const updateLoading = ref(false);
+const appVersion = ref("");
+const appVersionLabel = computed(() => appVersion.value || t("unknownVersion"));
 
 // Theme button: the icon / tooltip show the theme the user will switch TO, not the current one
 const themeIcon = computed(() => (theme.value === "dark" ? "mdi-weather-sunny" : "mdi-weather-night"));
@@ -380,6 +383,7 @@ onMounted(() => {
   window.addEventListener("scroll", onScrollClose, true);
   window.addEventListener("resize", updateTableHeight);
   nextTick(() => updateTableHeight());
+  getVersion().then((version) => { appVersion.value = version; }).catch(() => {});
 
   // Register metrics listeners and start streaming
   metricsStream.register();
@@ -503,22 +507,6 @@ async function doStopService() {
       <v-app-bar-title class="text-h6">
         {{ t('appTitle') }}
       </v-app-bar-title>
-      <v-spacer />
-      <v-btn size="small" variant="text" prepend-icon="mdi-translate" @click="toggleLocale">{{ t('language') }}</v-btn>
-
-      <v-tooltip :text="t('checkForUpdates')" location="bottom">
-        <template #activator="{ props }">
-          <v-btn v-bind="props" icon="mdi-update" variant="text" :loading="updateLoading" @click="checkForUpdates" />
-        </template>
-      </v-tooltip>
-
-      <!-- Theme toggle -->
-      <v-tooltip :text="themeTooltip" location="bottom">
-        <template #activator="{ props }">
-          <v-btn v-bind="props" :icon="themeIcon" variant="text" class="mr-2" @click="toggleTheme" />
-        </template>
-      </v-tooltip>
-
       <!-- CPU Info Bar -->
       <div class="cpu-info-bar d-none d-md-flex align-center mr-4" @contextmenu.prevent="openCpuInfoContextMenu">
         <v-chip size="small" variant="tonal" color="primary" class="mr-2">
@@ -532,6 +520,30 @@ async function doStopService() {
           </span>
         </v-chip>
       </div>
+
+      <v-spacer />
+      <v-menu location="bottom end">
+        <template #activator="{ props }">
+          <v-btn v-bind="props" size="small" variant="text" prepend-icon="mdi-information-outline">
+            {{ t('appVersion', { version: appVersionLabel }) }}
+          </v-btn>
+        </template>
+        <v-list density="compact" min-width="210">
+          <v-list-item :title="t('appVersion', { version: appVersionLabel })" prepend-icon="mdi-cpu-64-bit" />
+          <v-divider />
+          <v-list-item :title="t('checkForUpdates')" prepend-icon="mdi-update"
+            :disabled="updateLoading" @click="checkForUpdates" />
+        </v-list>
+      </v-menu>
+
+      <v-btn size="small" variant="text" prepend-icon="mdi-translate" @click="toggleLocale">{{ t('language') }}</v-btn>
+
+      <!-- Theme toggle -->
+      <v-tooltip :text="themeTooltip" location="bottom">
+        <template #activator="{ props }">
+          <v-btn v-bind="props" :icon="themeIcon" variant="text" class="mr-2" @click="toggleTheme" />
+        </template>
+      </v-tooltip>
 
       <!-- CPU Scale Toggle -->
       <v-tooltip :text="cpuScaleTooltip" location="bottom">

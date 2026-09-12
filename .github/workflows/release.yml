@@ -200,7 +200,9 @@ jobs:
           }
           if ($keySet) {
             New-Item -ItemType Directory -Force -Path "release-artifact/updater-${{ matrix.architecture }}" | Out-Null
-            $updaterName = "CPU-Manager_${{ github.ref_name }}_windows-${{ matrix.architecture }}-updater.exe"
+            # The minisign payload authenticates the original filename. Do not
+            # rename the signed installer after Tauri creates its .sig file.
+            $updaterName = $installer.Name
             $updaterPath = "release-artifact/updater-${{ matrix.architecture }}/$updaterName"
             Copy-Item $installer.FullName $updaterPath
             Copy-Item $installerSignature.FullName "$updaterPath.sig"
@@ -405,6 +407,7 @@ jobs:
           generate_release_notes: true
           files: |
             release-artifacts/*-setup.exe
+            release-artifacts/*-setup.exe.sig
             release-artifacts/*-updater.exe
             release-artifacts/*-updater.exe.sig
             release-artifacts/*.nsis.zip
