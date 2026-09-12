@@ -121,6 +121,10 @@ jobs:
             throw 'Configure both TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD, or remove both.'
           }
           if ($keySet) {
+            $keyPath = Join-Path $env:RUNNER_TEMP 'cpum-tauri.key'
+            [System.IO.File]::WriteAllText($keyPath, $env:TAURI_SIGNING_PRIVATE_KEY, [System.Text.UTF8Encoding]::new($false))
+            $env:TAURI_SIGNING_PRIVATE_KEY_PATH = $keyPath
+            Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY
             npx tauri build --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.updater.conf.json
           } else {
             npx tauri build --bundles nsis --target ${{ matrix.target }}
@@ -139,8 +143,12 @@ jobs:
         run: |
           # Tauri writes Windows bundle output to its configured target directory,
           # even when the Rust binary itself is cross-compiled for a target triple.
-          $bundleDir = "src-tauri/target/${{ matrix.target }}/release/bundle/nsis"
-          $installer = Get-ChildItem $bundleDir -Filter '*-setup.exe' | Select-Object -First 1
+          $targetRoot = 'src-tauri/target'
+          $bundleRoot = "$targetRoot/release/bundle"
+          $bundleDir = "$bundleRoot/nsis"
+          $installer = Get-ChildItem $targetRoot -Recurse -File -Filter '*-setup.exe' |
+            Where-Object { $_.FullName -match '[\\/]bundle[\\/]nsis[\\/]' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $installer) { throw 'Tauri did not produce an NSIS installer.' }
           New-Item -ItemType Directory -Force -Path 'release-artifact/installer' | Out-Null
           Copy-Item $installer.FullName "release-artifact/installer/CPU-Manager_${{ github.ref_name }}_windows-${{ matrix.architecture }}-setup.exe"
@@ -148,12 +156,14 @@ jobs:
           # Collect updater artifacts. Their presence depends on a chain of
           # preconditions in `tauri build`; an empty glob is not a diagnosis,
           # so report exactly which link in the chain is broken.
-          $archives = @(Get-ChildItem $bundleDir -Filter '*.nsis.zip' -ErrorAction SilentlyContinue)
-          $signatures = @(Get-ChildItem $bundleDir -Filter '*.nsis.zip.sig' -ErrorAction SilentlyContinue)
+          $archives = @(Get-ChildItem $targetRoot -Recurse -File -Filter '*.nsis.zip' -ErrorAction SilentlyContinue)
+          $signatures = @(Get-ChildItem $targetRoot -Recurse -File -Filter '*.nsis.zip.sig' -ErrorAction SilentlyContinue)
           $keySet       = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)
           $passwordSet  = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
           if ($keySet -ne $passwordSet) { throw 'Tauri updater signing configuration is incomplete.' }
           if ($keySet -and ($archives.Count -ne 1 -or $signatures.Count -ne 1)) {
+            Write-Host 'Bundle files produced by Tauri:'
+            Get-ChildItem $targetRoot -Recurse -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
             throw 'Tauri signing was configured but exactly one .nsis.zip and one matching .nsis.zip.sig were not produced.'
           }
           if ($keySet) {
