@@ -106,14 +106,26 @@ jobs:
       - name: Build NSIS installer
         # Tauri reads `TAURI_SIGNING_PRIVATE_KEY` (and optional
         # `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) to produce updater artifacts
-        # alongside the installer: `<name>.nsis.zip`, the matching `.sig`
-        # files, and a per-architecture `latest.json`. When the secret is
+        # alongside the installer: `<name>.nsis.zip` and the matching `.sig`.
+        # This workflow generates a per-architecture `latest.json`. When the secret is
         # absent the build still succeeds but no updater artifacts are
         # produced and the release step below skips them.
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx tauri build --bundles nsis --target ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          $keySet = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)
+          $passwordSet = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
+          if ($keySet -ne $passwordSet) {
+            throw 'Configure both TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD, or remove both.'
+          }
+          if ($keySet) {
+            npx tauri build --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.updater.conf.json
+          } else {
+            npx tauri build --bundles nsis --target ${{ matrix.target }}
+          }
+          if ($LASTEXITCODE -ne 0) { throw "tauri build failed with exit code $LASTEXITCODE." }
 
       - name: Prepare installer artifact
         # Carry the signing env vars forward so the PowerShell block below
@@ -136,27 +148,44 @@ jobs:
           # Collect updater artifacts. Their presence depends on a chain of
           # preconditions in `tauri build`; an empty glob is not a diagnosis,
           # so report exactly which link in the chain is broken.
-          $updater = @(
-            Get-ChildItem $bundleDir -Filter '*.nsis.zip' -ErrorAction SilentlyContinue
-            Get-ChildItem $bundleDir -Filter '*.nsis.zip.sig' -ErrorAction SilentlyContinue
-            Get-ChildItem $bundleDir -Filter '*-setup.exe.sig' -ErrorAction SilentlyContinue
-            Get-ChildItem $bundleDir -Filter 'latest.json' -ErrorAction SilentlyContinue
-          )
-          if ($updater.Count -gt 0) {
+          $archives = @(Get-ChildItem $bundleDir -Filter '*.nsis.zip' -ErrorAction SilentlyContinue)
+          $signatures = @(Get-ChildItem $bundleDir -Filter '*.nsis.zip.sig' -ErrorAction SilentlyContinue)
+          $keySet       = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)
+          $passwordSet  = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
+          if ($keySet -ne $passwordSet) { throw 'Tauri updater signing configuration is incomplete.' }
+          if ($keySet -and ($archives.Count -ne 1 -or $signatures.Count -ne 1)) {
+            throw 'Tauri signing was configured but exactly one .nsis.zip and one matching .nsis.zip.sig were not produced.'
+          }
+          if ($keySet) {
             New-Item -ItemType Directory -Force -Path "release-artifact/updater-${{ matrix.architecture }}" | Out-Null
-            $updater | Copy-Item -Destination "release-artifact/updater-${{ matrix.architecture }}/"
-            Write-Host "Collected $($updater.Count) updater artifact(s) for ${{ matrix.architecture }}."
+            $archiveName = "CPU-Manager_${{ github.ref_name }}_windows-${{ matrix.architecture }}.nsis.zip"
+            $archivePath = "release-artifact/updater-${{ matrix.architecture }}/$archiveName"
+            Copy-Item $archives[0].FullName $archivePath
+            Copy-Item $signatures[0].FullName "$archivePath.sig"
+
+            $platform = if ('${{ matrix.architecture }}' -eq 'arm64') { 'windows-aarch64' } else { 'windows-x86_64' }
+            $version = '${{ github.ref_name }}' -replace '^v', ''
+            $signature = (Get-Content $signatures[0].FullName -Raw).Trim()
+            $manifest = [ordered]@{
+              version = $version
+              pub_date = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+              platforms = [ordered]@{
+                $platform = [ordered]@{
+                  signature = $signature
+                  url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$archiveName"
+                }
+              }
+            }
+            $manifest | ConvertTo-Json -Depth 10 | Set-Content "release-artifact/updater-${{ matrix.architecture }}/latest-${{ matrix.architecture }}.json"
+            Write-Host "Prepared signed updater artifacts for ${{ matrix.architecture }}."
           } else {
             # No updater files on disk. Diagnose which precondition is missing
             # so the user does not have to guess between secret, password, or
             # pubkey mismatch.
-            $keySet       = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)
-            $passwordSet  = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
             $pubkeyInConf = -not [string]::IsNullOrEmpty(((Get-Content 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json).plugins.updater.pubkey))
             $reasons = New-Object System.Collections.Generic.List[string]
             if (-not $keySet)      { $reasons.Add('TAURI_SIGNING_PRIVATE_KEY secret is empty (set it in repo Settings > Secrets and variables > Actions)') }
-            if ($keySet -and -not $passwordSet) { $reasons.Add('TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is empty or unset (the Tauri keystore is encrypted; a non-empty password is required because GitHub does not allow empty secrets)') }
-            if ($keySet -and $passwordSet -and -not $pubkeyInConf) { $reasons.Add('plugins.updater.pubkey in src-tauri/tauri.conf.json is empty') }
+            if ($passwordSet) { $reasons.Add('TAURI_SIGNING_PRIVATE_KEY_PASSWORD is set but TAURI_SIGNING_PRIVATE_KEY is empty') }
             if ($reasons.Count -eq 0) {
               $reasons.Add('tauri build did not produce updater artifacts even though the env vars are set; most likely the password is wrong, or the pubkey in tauri.conf.json does not match the private key. Re-run with ACTIONS_STEP_DEBUG=true to see the bundler warning.')
             }
@@ -202,10 +231,8 @@ jobs:
           pattern: windows-*-updater
           merge-multiple: true
           path: updater-artifacts
-          # If no updater artifacts were produced (TAURI_SIGNING_PRIVATE_KEY
-          # was not set in the build matrix), the directory is absent and
-          # downstream steps must handle that gracefully.
-          if-no-files-found: ignore
+          # If signing is disabled, no updater artifact exists. The action
+          # leaves the destination empty and downstream steps skip it.
 
       - name: Detect SignPath configuration
         id: signing-config
@@ -277,15 +304,17 @@ jobs:
           # per-arch latest.json). When the build matrix was run without
           # TAURI_SIGNING_PRIVATE_KEY the directory is absent and we skip
           # this section entirely.
-          if (Test-Path 'updater-artifacts') {
-            Get-ChildItem 'updater-artifacts' -Recurse -File | Copy-Item -Destination 'release-artifacts/'
+          $downloadedUpdaterFiles = @(Get-ChildItem 'updater-artifacts' -Recurse -File -ErrorAction SilentlyContinue)
+          if ($downloadedUpdaterFiles.Count -gt 0) {
+            $downloadedUpdaterFiles | Copy-Item -Destination 'release-artifacts/'
 
-            # Tauri generates one latest.json per architecture, each with a
-            # single `platforms` entry. Merge them so the published
+            # The build jobs generate one latest.json per architecture, each
+            # with a single `platforms` entry. Merge them so the published
             # `latest.json` (at the endpoint configured in
             # `tauri.conf.json`) advertises every Windows architecture in
             # the same release.
             $latestFiles = @(Get-ChildItem 'release-artifacts' -Filter 'latest-*.json')
+            if ($latestFiles.Count -ne 2) { throw "Expected two updater manifests, found $($latestFiles.Count)." }
             if ($latestFiles.Count -gt 1) {
               $combined = [ordered]@{
                 version  = $null

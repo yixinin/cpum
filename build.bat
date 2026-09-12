@@ -3,7 +3,8 @@ setlocal EnableExtensions EnableDelayedExpansion
 set "ROOT=%~dp0"
 cd /d "%ROOT%"
 
-set "BUNDLE_DIR=src-tauri\target\release\bundle\nsis"
+set "BUNDLE_ROOT=src-tauri\target\release\bundle"
+set "BUNDLE_DIR=%BUNDLE_ROOT%\nsis"
 set "RELEASE_DIR=release"
 set "UPDATER_KEY=src-tauri\tauri.key"
 
@@ -26,12 +27,14 @@ popd
 
 echo [4/5] Building NSIS installer...
 if exist "%UPDATER_KEY%" (
-  echo       Found %UPDATER_KEY% - updater artifacts (.nsis.zip, .sig, latest.json) will be signed.
+  echo       Found %UPDATER_KEY% - updater artifacts (.nsis.zip and .sig) will be signed.
+  set "TAURI_SIGNING_PRIVATE_KEY_PATH=%UPDATER_KEY%"
+  call npx tauri build --bundles nsis --config src-tauri\tauri.updater.conf.json
 ) else (
   echo       No %UPDATER_KEY% found - skipping updater signing. Generate one with
   echo       "npx tauri signer generate -w %UPDATER_KEY%" to enable local signing.
+  call npx tauri build --bundles nsis
 )
-call npx tauri build --bundles nsis
 if errorlevel 1 goto :failed
 
 echo [5/5] Collecting updater artifacts and writing SHA256SUMS...
@@ -50,7 +53,7 @@ for %%I in ("%BUNDLE_DIR%\*-setup.exe") do (
 
 rem Copy updater artifacts when Tauri produced them (requires tauri.key on PATH).
 set "HAVE_UPDATER=0"
-for %%I in ("%BUNDLE_DIR%\*.nsis.zip" "%BUNDLE_DIR%\*.nsis.zip.sig" "%BUNDLE_DIR%\*-setup.exe.sig" "%BUNDLE_DIR%\latest.json") do (
+for %%I in ("%BUNDLE_DIR%\*.nsis.zip" "%BUNDLE_DIR%\*.nsis.zip.sig" "%BUNDLE_DIR%\*-setup.exe.sig") do (
   if exist "%%~fI" (
     copy /Y "%%~fI" "%RELEASE_DIR%\" >nul
     if errorlevel 1 goto :failed

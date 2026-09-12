@@ -13,9 +13,8 @@ configured in `src-tauri/tauri.conf.json` under `plugins.updater`.
 The updater client (when invoked from the frontend) fetches
 `latest.json` from the configured endpoint, verifies each entry's minisign
 signature against the embedded public key, then downloads and applies the
-matching `.nsis.zip`. The frontend does not currently call the updater API;
-the release pipeline still emits the signed artifacts so a future in-app
-update button can opt in without rebuilding the release tooling.
+matching `.nsis.zip`. The main window exposes a manual update button that
+checks, downloads, and installs the update through the updater API.
 
 ## Key generation
 
@@ -120,8 +119,8 @@ serves without authentication.
 
 `build.bat` mirrors the CI pipeline. If `src-tauri/tauri.key` is present on
 the build machine, the resulting NSIS bundle directory contains the signed
-`.nsis.zip`, the `.sig` files, and `latest.json`. The script then copies
-them to a top-level `release/` directory alongside the installer and writes
+`.nsis.zip` and `.sig` files. The script then copies them to a top-level
+`release/` directory alongside the installer and writes
 `SHA256SUMS.txt` using the same format the release job uses.
 
 To verify the local checksum file:

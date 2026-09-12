@@ -25,6 +25,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": false,
     "resources": {
       "target/release/cpum_service.exe": "cpum_service.exe"
     },
