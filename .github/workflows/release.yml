@@ -124,11 +124,20 @@ jobs:
             $keyPath = Join-Path $env:RUNNER_TEMP 'cpum-tauri.key'
             [System.IO.File]::WriteAllText($keyPath, $env:TAURI_SIGNING_PRIVATE_KEY, [System.Text.UTF8Encoding]::new($false))
             $env:TAURI_SIGNING_PRIVATE_KEY_PATH = $keyPath
-            npx tauri build --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.updater.conf.json
+            $keyInfo = Get-Item $keyPath
+            $keyLineCount = @(Get-Content $keyPath).Count
+            Write-Host "Updater signing diagnostics: keyFileBytes=$($keyInfo.Length), keyLines=$keyLineCount, passwordSet=$passwordSet"
+            Write-Host 'Effective updater override:'
+            Get-Content src-tauri/tauri.updater.conf.json
+            npx tauri build --verbose --bundles nsis --target ${{ matrix.target }} --config "$PWD/src-tauri/tauri.updater.conf.json"
           } else {
             npx tauri build --bundles nsis --target ${{ matrix.target }}
           }
           if ($LASTEXITCODE -ne 0) { throw "tauri build failed with exit code $LASTEXITCODE." }
+          Write-Host 'Files generated under src-tauri/target after Tauri build:'
+          Get-ChildItem 'src-tauri/target' -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '[\\/]bundle[\\/]' } |
+            Select-Object FullName, Length, LastWriteTime
 
       - name: Prepare installer artifact
         # Carry the signing env vars forward so the PowerShell block below
