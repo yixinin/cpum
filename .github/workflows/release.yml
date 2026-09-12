@@ -128,10 +128,10 @@ jobs:
             $keyLineCount = @(Get-Content $keyPath).Count
             Write-Host "Updater signing diagnostics: keyFileBytes=$($keyInfo.Length), keyLines=$keyLineCount, passwordSet=$passwordSet"
             Write-Host 'Effective updater override:'
-            Get-Content src-tauri/tauri.updater.conf.json
-            npx tauri build --verbose --bundles nsis --target ${{ matrix.target }} --config "$PWD/src-tauri/tauri.updater.conf.json"
+            Get-Content src-tauri/tauri.conf.json | Select-String -Pattern 'createUpdaterArtifacts|pubkey' -Context 0,0
+            npx tauri build --verbose --bundles nsis --target ${{ matrix.target }}
           } else {
-            npx tauri build --bundles nsis --target ${{ matrix.target }}
+            npx tauri build --bundles nsis --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":false}}'
           }
           if ($LASTEXITCODE -ne 0) { throw "tauri build failed with exit code $LASTEXITCODE." }
           Write-Host 'Files generated under src-tauri/target after Tauri build:'

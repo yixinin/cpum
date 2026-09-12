@@ -29,11 +29,11 @@ echo [4/5] Building NSIS installer...
 if exist "%UPDATER_KEY%" (
   echo       Found %UPDATER_KEY% - updater artifacts (.nsis.zip and .sig) will be signed.
   set "TAURI_SIGNING_PRIVATE_KEY_PATH=%UPDATER_KEY%"
-  call npx tauri build --bundles nsis --config src-tauri\tauri.updater.conf.json
+  call npx tauri build --bundles nsis
 ) else (
   echo       No %UPDATER_KEY% found - skipping updater signing. Generate one with
   echo       "npx tauri signer generate -w %UPDATER_KEY%" to enable local signing.
-  call npx tauri build --bundles nsis
+  call npx tauri build --bundles nsis --config "{\"bundle\":{\"createUpdaterArtifacts\":false}}"
 )
 if errorlevel 1 goto :failed
 
