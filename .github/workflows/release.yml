@@ -155,32 +155,36 @@ jobs:
           # Collect updater artifacts. Their presence depends on a chain of
           # preconditions in `tauri build`; an empty glob is not a diagnosis,
           # so report exactly which link in the chain is broken.
-          $archives = @(Get-ChildItem $targetRoot -Recurse -File -Filter '*.nsis.zip' -ErrorAction SilentlyContinue)
-          $signatures = @(Get-ChildItem $targetRoot -Recurse -File -Filter '*.nsis.zip.sig' -ErrorAction SilentlyContinue)
+          $archives = @(Get-ChildItem $targetRoot -Recurse -File -Filter '*.nsis.zip' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending)
+          $archive = $archives | Select-Object -First 1
+          $signature = if ($archive) {
+            Get-Item "$($archive.FullName).sig" -ErrorAction SilentlyContinue
+          }
           $keySet       = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)
           $passwordSet  = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
           if ($keySet -ne $passwordSet) { throw 'Tauri updater signing configuration is incomplete.' }
-          if ($keySet -and ($archives.Count -ne 1 -or $signatures.Count -ne 1)) {
+          if ($keySet -and (-not $archive -or -not $signature)) {
             Write-Host 'Bundle files produced by Tauri:'
             Get-ChildItem $targetRoot -Recurse -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-            throw 'Tauri signing was configured but exactly one .nsis.zip and one matching .nsis.zip.sig were not produced.'
+            throw 'Tauri signing was configured but no signed .nsis.zip with its matching .sig was found.'
           }
           if ($keySet) {
             New-Item -ItemType Directory -Force -Path "release-artifact/updater-${{ matrix.architecture }}" | Out-Null
             $archiveName = "CPU-Manager_${{ github.ref_name }}_windows-${{ matrix.architecture }}.nsis.zip"
             $archivePath = "release-artifact/updater-${{ matrix.architecture }}/$archiveName"
-            Copy-Item $archives[0].FullName $archivePath
-            Copy-Item $signatures[0].FullName "$archivePath.sig"
+            Copy-Item $archive.FullName $archivePath
+            Copy-Item $signature.FullName "$archivePath.sig"
 
             $platform = if ('${{ matrix.architecture }}' -eq 'arm64') { 'windows-aarch64' } else { 'windows-x86_64' }
             $version = '${{ github.ref_name }}' -replace '^v', ''
-            $signature = (Get-Content $signatures[0].FullName -Raw).Trim()
+            $signatureText = (Get-Content $signature.FullName -Raw).Trim()
             $manifest = [ordered]@{
               version = $version
               pub_date = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
               platforms = [ordered]@{
                 $platform = [ordered]@{
-                  signature = $signature
+                  signature = $signatureText
                   url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$archiveName"
                 }
               }
