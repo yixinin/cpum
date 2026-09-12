@@ -258,6 +258,10 @@ const messages: Record<Locale, Record<string, string>> = {
     uninstallFailed: "卸载失败: {error}",
     startFailed: "启动失败: {error}",
     stopFailed: "停止失败: {error}",
+    checkForUpdates: "检查更新",
+    noUpdateAvailable: "已是最新版本",
+    updateInstalling: "正在安装版本 {version}",
+    updateCheckFailed: "检查更新失败: {error}",
   },
   "en-US": {
     // ---------- Common ----------
@@ -512,6 +516,10 @@ const messages: Record<Locale, Record<string, string>> = {
     uninstallFailed: "Uninstall failed: {error}",
     startFailed: "Start failed: {error}",
     stopFailed: "Stop failed: {error}",
+    checkForUpdates: "Check for updates",
+    noUpdateAvailable: "You are up to date",
+    updateInstalling: "Installing version {version}",
+    updateCheckFailed: "Update check failed: {error}",
   },
 };
 

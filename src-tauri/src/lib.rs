@@ -702,6 +702,12 @@ fn stop_service() -> Result<String, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Updater plugin: serves the embedded `plugins.updater` config
+        // (pubkey + endpoints) to the frontend, which uses
+        // `@tauri-apps/plugin-updater` to check and apply releases. Build-time
+        // signing is handled in `.github/workflows/release.yml` via
+        // `TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]`.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_cpu_topology,
             get_logical_processor_usage,

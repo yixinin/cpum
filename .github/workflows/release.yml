@@ -104,24 +104,150 @@ jobs:
           Write-Host "Set tauri version to $version"
 
       - name: Build NSIS installer
-        run: npx tauri build --bundles nsis --target ${{ matrix.target }}
+        # Tauri reads `TAURI_SIGNING_PRIVATE_KEY` (and optional
+        # `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) to produce updater artifacts
+        # alongside the installer: `<name>.nsis.zip` and the matching `.sig`.
+        # This workflow generates a per-architecture `latest.json`. When the secret is
+        # absent the build still succeeds but no updater artifacts are
+        # produced and the release step below skips them.
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: pwsh
+        run: |
+          $keySet = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)
+          $passwordSet = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
+          if ($keySet -ne $passwordSet) {
+            throw 'Configure both TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD, or remove both.'
+          }
+          if ($keySet) {
+            $keyPath = Join-Path $env:RUNNER_TEMP 'cpum-tauri.key'
+            $diagDir = Join-Path $PWD 'updater-diagnostics'
+            New-Item -ItemType Directory -Force -Path $diagDir | Out-Null
+            [System.IO.File]::WriteAllText($keyPath, $env:TAURI_SIGNING_PRIVATE_KEY, [System.Text.UTF8Encoding]::new($false))
+            $keyInfo = Get-Item $keyPath
+            $keyLineCount = @(Get-Content $keyPath).Count
+            Write-Host "Updater signing diagnostics: keyFileBytes=$($keyInfo.Length), keyLines=$keyLineCount, passwordSet=$passwordSet"
+            $probe = Join-Path $env:RUNNER_TEMP 'cpum-updater-sign-probe.txt'
+            Set-Content -Path $probe -Value 'cpum updater signing probe' -NoNewline
+            $probeLog = Join-Path $diagDir 'signer-probe.log'
+            & npx tauri signer sign --verbose --password $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD $probe *> $probeLog
+            $probeExit = $LASTEXITCODE
+            Write-Host "Signer preflight exitCode=$probeExit"
+            Get-Content $probeLog -ErrorAction SilentlyContinue
+            if ($probeExit -ne 0) {
+              throw "Signer preflight failed with exit code $probeExit. See updater-diagnostics/signer-probe.log for the private-key/password error."
+            }
+            Remove-Item "$probe.sig" -ErrorAction SilentlyContinue
+            Write-Host 'Effective updater override:'
+            Get-Content src-tauri/tauri.conf.json | Select-String -Pattern 'createUpdaterArtifacts|pubkey' -Context 0,0
+            $buildLog = Join-Path $diagDir 'tauri-build.log'
+            & npx tauri build --verbose --bundles nsis --target ${{ matrix.target }} 2>&1 | Tee-Object -FilePath $buildLog
+            if ($LASTEXITCODE -ne 0) { throw "tauri build failed with exit code $LASTEXITCODE. See updater-diagnostics/tauri-build.log." }
+          } else {
+            npx tauri build --bundles nsis --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          }
+          if ($LASTEXITCODE -ne 0) { throw "tauri build failed with exit code $LASTEXITCODE." }
+          Write-Host 'Files generated under src-tauri/target after Tauri build:'
+          Get-ChildItem 'src-tauri/target' -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '[\\/]bundle[\\/]' } |
+            Select-Object FullName, Length, LastWriteTime
+
+      - name: Upload updater diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: updater-diagnostics-${{ matrix.architecture }}
+          path: updater-diagnostics/*
+          if-no-files-found: ignore
 
       - name: Prepare installer artifact
+        # Carry the signing env vars forward so the PowerShell block below
+        # can distinguish between "secret not configured" and "secret set
+        # but tauri build silently skipped signing" (the latter is almost
+        # always a wrong / missing TAURI_SIGNING_PRIVATE_KEY_PASSWORD).
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         shell: pwsh
         run: |
           # Tauri writes Windows bundle output to its configured target directory,
           # even when the Rust binary itself is cross-compiled for a target triple.
-          $installer = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter '*-setup.exe' | Select-Object -First 1
+          $targetRoot = 'src-tauri/target'
+          $bundleRoot = "$targetRoot/release/bundle"
+          $bundleDir = "$bundleRoot/nsis"
+          $installer = Get-ChildItem $targetRoot -Recurse -File -Filter '*-setup.exe' |
+            Where-Object { $_.FullName -match '[\\/]bundle[\\/]nsis[\\/]' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $installer) { throw 'Tauri did not produce an NSIS installer.' }
-          New-Item -ItemType Directory -Force -Path 'release-artifact' | Out-Null
-          Copy-Item $installer.FullName "release-artifact/CPU-Manager_${{ github.ref_name }}_windows-${{ matrix.architecture }}-setup.exe"
+          New-Item -ItemType Directory -Force -Path 'release-artifact/installer' | Out-Null
+          Copy-Item $installer.FullName "release-artifact/installer/CPU-Manager_${{ github.ref_name }}_windows-${{ matrix.architecture }}-setup.exe"
+
+          # Collect updater artifacts. Their presence depends on a chain of
+          # preconditions in `tauri build`; an empty glob is not a diagnosis,
+          # so report exactly which link in the chain is broken.
+          $installerSignature = Get-Item "$($installer.FullName).sig" -ErrorAction SilentlyContinue
+          $keySet       = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)
+          $passwordSet  = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
+          Write-Host "Updater artifact scan: keySet=$keySet passwordSet=$passwordSet installerSignaturePresent=$([bool]$installerSignature)"
+          Write-Host 'All updater candidates:'
+          Get-ChildItem $targetRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '\.(nsis\.zip|nsis\.zip\.sig|sig)$' } |
+            Select-Object FullName, Length, LastWriteTime
+          if ($keySet -ne $passwordSet) { throw 'Tauri updater signing configuration is incomplete.' }
+          if ($keySet -and -not $installerSignature) {
+            throw "Updater diagnosis: Tauri signed installer signature was not found at $($installer.FullName).sig. The build log should contain the signer error."
+          }
+          if ($keySet) {
+            New-Item -ItemType Directory -Force -Path "release-artifact/updater-${{ matrix.architecture }}" | Out-Null
+            $updaterName = "CPU-Manager_${{ github.ref_name }}_windows-${{ matrix.architecture }}-updater.exe"
+            $updaterPath = "release-artifact/updater-${{ matrix.architecture }}/$updaterName"
+            Copy-Item $installer.FullName $updaterPath
+            Copy-Item $installerSignature.FullName "$updaterPath.sig"
+
+            $platform = if ('${{ matrix.architecture }}' -eq 'arm64') { 'windows-aarch64' } else { 'windows-x86_64' }
+            $version = '${{ github.ref_name }}' -replace '^v', ''
+            $signatureText = (Get-Content $installerSignature.FullName -Raw).Trim()
+            $manifest = [ordered]@{
+              version = $version
+              pub_date = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+              platforms = [ordered]@{
+                $platform = [ordered]@{
+                  signature = $signatureText
+                  url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$updaterName"
+                }
+              }
+            }
+            $manifest | ConvertTo-Json -Depth 10 | Set-Content "release-artifact/updater-${{ matrix.architecture }}/latest-${{ matrix.architecture }}.json"
+            Write-Host "Prepared signed updater artifacts for ${{ matrix.architecture }}."
+          } else {
+            # No updater files on disk. Diagnose which precondition is missing
+            # so the user does not have to guess between secret, password, or
+            # pubkey mismatch.
+            $pubkeyInConf = -not [string]::IsNullOrEmpty(((Get-Content 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json).plugins.updater.pubkey))
+            $reasons = New-Object System.Collections.Generic.List[string]
+            if (-not $keySet)      { $reasons.Add('TAURI_SIGNING_PRIVATE_KEY secret is empty (set it in repo Settings > Secrets and variables > Actions)') }
+            if ($passwordSet) { $reasons.Add('TAURI_SIGNING_PRIVATE_KEY_PASSWORD is set but TAURI_SIGNING_PRIVATE_KEY is empty') }
+            if ($reasons.Count -eq 0) {
+              $reasons.Add('tauri build did not produce updater artifacts even though the env vars are set; most likely the password is wrong, or the pubkey in tauri.conf.json does not match the private key. Re-run with ACTIONS_STEP_DEBUG=true to see the bundler warning.')
+            }
+            Write-Host "::warning::No updater artifacts for ${{ matrix.architecture }}. Likely cause(s):"
+            foreach ($r in $reasons) { Write-Host "::warning::  - $r" }
+          }
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
           name: windows-${{ matrix.architecture }}-installer
-          path: release-artifact/*-setup.exe
+          path: release-artifact/installer/*
           if-no-files-found: error
+
+      - name: Upload updater artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.architecture }}-updater
+          path: release-artifact/updater-${{ matrix.architecture }}/*
+          if-no-files-found: ignore
 
   release:
     needs: build
@@ -140,6 +266,15 @@ jobs:
           pattern: windows-*-installer
           merge-multiple: true
           path: unsigned-installers
+
+      - name: Download updater artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*-updater
+          merge-multiple: true
+          path: updater-artifacts
+          # If signing is disabled, no updater artifact exists. The action
+          # leaves the destination empty and downstream steps skip it.
 
       - name: Detect SignPath configuration
         id: signing-config
@@ -207,8 +342,72 @@ jobs:
           New-Item -ItemType Directory -Force -Path 'release-artifacts' | Out-Null
           Copy-Item $installers.FullName 'release-artifacts/'
 
+          # Pull in any updater artifacts (zipped installers, signatures,
+          # per-arch latest.json). When the build matrix was run without
+          # TAURI_SIGNING_PRIVATE_KEY the directory is absent and we skip
+          # this section entirely.
+          $downloadedUpdaterFiles = @(Get-ChildItem 'updater-artifacts' -Recurse -File -ErrorAction SilentlyContinue)
+          if ($downloadedUpdaterFiles.Count -gt 0) {
+            $downloadedUpdaterFiles | Copy-Item -Destination 'release-artifacts/'
+
+            # The build jobs generate one latest.json per architecture, each
+            # with a single `platforms` entry. Merge them so the published
+            # `latest.json` (at the endpoint configured in
+            # `tauri.conf.json`) advertises every Windows architecture in
+            # the same release.
+            $latestFiles = @(Get-ChildItem 'release-artifacts' -Filter 'latest-*.json')
+            if ($latestFiles.Count -ne 2) { throw "Expected two updater manifests, found $($latestFiles.Count)." }
+            if ($latestFiles.Count -gt 1) {
+              $combined = [ordered]@{
+                version  = $null
+                pub_date = $null
+                platforms = [ordered]@{}
+              }
+              foreach ($file in ($latestFiles | Sort-Object Name)) {
+                $json = Get-Content $file.FullName -Raw | ConvertFrom-Json
+                if (-not $combined.version) {
+                  $combined.version  = $json.version
+                  $combined.pub_date = $json.pub_date
+                }
+                foreach ($prop in $json.platforms.PSObject.Properties) {
+                  $combined.platforms[$prop.Name] = $prop.Value
+                }
+              }
+              $combined | ConvertTo-Json -Depth 20 | Set-Content 'release-artifacts/latest.json'
+              $latestFiles | Remove-Item
+            } elseif ($latestFiles.Count -eq 1) {
+              # Single-arch build: just rename so the endpoint path is stable.
+              Move-Item $latestFiles[0].FullName 'release-artifacts/latest.json'
+            }
+          } else {
+            Write-Host 'No updater artifacts to publish.'
+          }
+
+      - name: Generate SHA256SUMS
+        shell: pwsh
+        # Emit a portable `sha256sum -c` compatible manifest over every file
+        # we are about to publish. LF line endings and no BOM, so users on
+        # macOS / Linux can verify the release without manual conversion.
+        run: |
+          $lines = [System.Collections.Generic.List[string]]::new()
+          Get-ChildItem 'release-artifacts' -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            $lines.Add("$hash  $($_.Name)")
+          }
+          $content = ($lines -join "`n") + "`n"
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::WriteAllText('release-artifacts/SHA256SUMS.txt', $content, $utf8NoBom)
+          Get-Content 'release-artifacts/SHA256SUMS.txt'
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: release-artifacts/*-setup.exe
+          files: |
+            release-artifacts/*-setup.exe
+            release-artifacts/*-updater.exe
+            release-artifacts/*-updater.exe.sig
+            release-artifacts/*.nsis.zip
+            release-artifacts/*.nsis.zip.sig
+            release-artifacts/latest.json
+            release-artifacts/SHA256SUMS.txt

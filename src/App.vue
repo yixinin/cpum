@@ -14,8 +14,10 @@ import AffinityRuleManager from "./components/AffinityRuleManager.vue";
 import ProBalancePanel from "./components/ProBalancePanel.vue";
 import { useI18n } from "./i18n";
 import { useTheme } from "./composables/useTheme";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 const { t, toggleLocale } = useI18n();
 const { theme, toggleTheme } = useTheme();
+const updateLoading = ref(false);
 
 // Theme button: the icon / tooltip show the theme the user will switch TO, not the current one
 const themeIcon = computed(() => (theme.value === "dark" ? "mdi-weather-sunny" : "mdi-weather-night"));
@@ -214,6 +216,24 @@ function showSnack(text: string, color: "success" | "error" | "info" = "info") {
   snackbarText.value = text;
   snackbarColor.value = color;
   snackbar.value = true;
+}
+
+async function checkForUpdates() {
+  if (updateLoading.value) return;
+  updateLoading.value = true;
+  try {
+    const update: Update | null = await check();
+    if (!update) {
+      showSnack(t("noUpdateAvailable"), "info");
+      return;
+    }
+    showSnack(t("updateInstalling", { version: update.version }), "info");
+    await update.downloadAndInstall();
+  } catch (e) {
+    showSnack(t("updateCheckFailed", { error: String(e) }), "error");
+  } finally {
+    updateLoading.value = false;
+  }
 }
 
 function rebuildProcessesByPid() {
@@ -485,6 +505,12 @@ async function doStopService() {
       </v-app-bar-title>
       <v-spacer />
       <v-btn size="small" variant="text" prepend-icon="mdi-translate" @click="toggleLocale">{{ t('language') }}</v-btn>
+
+      <v-tooltip :text="t('checkForUpdates')" location="bottom">
+        <template #activator="{ props }">
+          <v-btn v-bind="props" icon="mdi-update" variant="text" :loading="updateLoading" @click="checkForUpdates" />
+        </template>
+      </v-tooltip>
 
       <!-- Theme toggle -->
       <v-tooltip :text="themeTooltip" location="bottom">

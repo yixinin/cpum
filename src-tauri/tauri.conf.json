@@ -25,6 +25,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "resources": {
       "target/release/cpum_service.exe": "cpum_service.exe"
     },
@@ -44,6 +45,17 @@
         "installMode": "perMachine",
         "installerHooks": "installer-hooks.nsh",
         "displayLanguageSelector": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMwODBGODNCOTE5MENDQjMKUldTenpKQ1JPL2lBTUE5MVJ3UldvUUg0Nm1WdFpWZDQxd25XbExPZ2szZEMwclpDTkxuN25UcTQK",
+      "endpoints": [
+        "https://github.com/yixinin/cpum/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }
