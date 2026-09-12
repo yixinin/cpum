@@ -125,14 +125,13 @@ jobs:
             $diagDir = Join-Path $PWD 'updater-diagnostics'
             New-Item -ItemType Directory -Force -Path $diagDir | Out-Null
             [System.IO.File]::WriteAllText($keyPath, $env:TAURI_SIGNING_PRIVATE_KEY, [System.Text.UTF8Encoding]::new($false))
-            $env:TAURI_SIGNING_PRIVATE_KEY_PATH = $keyPath
             $keyInfo = Get-Item $keyPath
             $keyLineCount = @(Get-Content $keyPath).Count
             Write-Host "Updater signing diagnostics: keyFileBytes=$($keyInfo.Length), keyLines=$keyLineCount, passwordSet=$passwordSet"
             $probe = Join-Path $env:RUNNER_TEMP 'cpum-updater-sign-probe.txt'
             Set-Content -Path $probe -Value 'cpum updater signing probe' -NoNewline
             $probeLog = Join-Path $diagDir 'signer-probe.log'
-            & npx tauri signer sign --verbose --private-key-path $keyPath --password $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD $probe *> $probeLog
+            & npx tauri signer sign --verbose --password $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD $probe *> $probeLog
             $probeExit = $LASTEXITCODE
             Write-Host "Signer preflight exitCode=$probeExit"
             Get-Content $probeLog -ErrorAction SilentlyContinue
