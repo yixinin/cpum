@@ -172,11 +172,17 @@ jobs:
           }
           $keySet       = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)
           $passwordSet  = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
+          Write-Host "Updater artifact scan: keySet=$keySet passwordSet=$passwordSet archiveCount=$($archives.Count)"
+          Write-Host 'All updater candidates:'
+          Get-ChildItem $targetRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '\.(nsis\.zip|nsis\.zip\.sig|sig)$' } |
+            Select-Object FullName, Length, LastWriteTime
           if ($keySet -ne $passwordSet) { throw 'Tauri updater signing configuration is incomplete.' }
           if ($keySet -and (-not $archive -or -not $signature)) {
-            Write-Host 'Bundle files produced by Tauri:'
-            Get-ChildItem $targetRoot -Recurse -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-            throw 'Tauri signing was configured but no signed .nsis.zip with its matching .sig was found.'
+            if (-not $archive) {
+              throw 'Updater diagnosis: no .nsis.zip was generated. Tauri did not create an updater archive; inspect the verbose build log for createUpdaterArtifacts/config and signing warnings.'
+            }
+            throw "Updater diagnosis: archive exists but matching signature is missing. Archive=$($archive.FullName); expected signature=$($archive.FullName).sig"
           }
           if ($keySet) {
             New-Item -ItemType Directory -Force -Path "release-artifact/updater-${{ matrix.architecture }}" | Out-Null
