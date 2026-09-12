@@ -28,31 +28,40 @@ is suspected of being leaked):
 
 ```powershell
 # From the repository root, with the dev toolchain installed.
-npx tauri signer generate --ci -w src-tauri/tauri.key
+npx tauri signer generate -p "your-strong-password" --ci --force -w src-tauri/tauri.key
 ```
 
-`--ci` skips the password prompt and emits an unprotected key. To set a
-password instead, drop `--ci` and answer the prompts; the same password must
-later be supplied to the build as
-`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+A non-empty password is **required** because GitHub Actions does not allow
+empty secrets, and `tauri build` cannot decrypt the keystore when the
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` environment variable is empty or unset
+(it silently skips signing instead of erroring, so the build looks
+successful while no updater artifacts are produced). Store the same
+password in the `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` GitHub Actions secret.
 
-After regenerating, replace `src-tauri/tauri.pubkey` with the contents of the
-newly generated `tauri.key.pub` and copy the corresponding `tauri.key` into
-the `TAURI_SIGNING_PRIVATE_KEY` GitHub Actions secret.
+After regenerating, replace `src-tauri/tauri.pubkey` with the contents of
+the newly generated `tauri.key.pub`, update the `plugins.updater.pubkey`
+field in `src-tauri/tauri.conf.json` to match, and copy the corresponding
+`tauri.key` into the `TAURI_SIGNING_PRIVATE_KEY` GitHub Actions secret.
 
 ## CI secrets
 
 | Secret | Required | Purpose |
 |--------|----------|---------|
 | `TAURI_SIGNING_PRIVATE_KEY` | Recommended | The full text of `tauri.key`. The build job passes it to `tauri build`, which signs the updater artifacts. |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Optional | Only set if the keypair was generated with a password. |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | **Required** | Password the keystore was generated with. GitHub does not allow empty secrets, so a non-empty password is mandatory. |
 
 When `TAURI_SIGNING_PRIVATE_KEY` is unset, the build still succeeds and the
 NSIS installer is published, but no updater artifacts (`.nsis.zip`, `.sig`,
 `latest.json`) are produced. The release job detects the missing artifacts
 and publishes only the installers.
 
-To set the secret:
+When the private key is set but the password is wrong or missing, the
+Tauri bundler cannot decrypt the keystore and silently skips signing
+without failing the build - the symptom looks identical to "secret not
+configured". The "No updater artifacts" line in the build log is the
+canonical signal. Always set both secrets.
+
+To set the secrets:
 
 1. Run `Get-Content src-tauri/tauri.key` locally and copy the output.
 2. On GitHub, go to **Settings &rarr; Secrets and variables &rarr; Actions
@@ -60,6 +69,8 @@ To set the secret:
 3. Name it `TAURI_SIGNING_PRIVATE_KEY` and paste the value. (For multi-line
    values, GitHub accepts the literal newlines; the YAML job exposes it as
    `secrets.TAURI_SIGNING_PRIVATE_KEY` unchanged.)
+4. Repeat with `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` and the keystore
+   password.
 
 ## Release artifacts
 
