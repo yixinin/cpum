@@ -13,7 +13,7 @@ configured in `src-tauri/tauri.conf.json` under `plugins.updater`.
 The updater client (when invoked from the frontend) fetches
 `latest.json` from the configured endpoint, verifies each entry's minisign
 signature against the embedded public key, then downloads and applies the
-matching `.nsis.zip`. The main window exposes a manual update button that
+matching signed Windows installer. The main window exposes a manual update button that
 checks, downloads, and installs the update through the updater API.
 
 ## Key generation
@@ -83,10 +83,10 @@ following files in the GitHub release:
 |------|-------------|
 | `CPU-Manager_<tag>_windows-x64-setup.exe` | NSIS installer (x86_64), optionally Authenticode-signed by SignPath. |
 | `CPU-Manager_<tag>_windows-arm64-setup.exe` | NSIS installer (aarch64), optionally Authenticode-signed by SignPath. |
-| `CPU-Manager_<tag>_windows-x64.nsis.zip` | Zipped installer used by the in-app updater (x86_64). |
-| `CPU-Manager_<tag>_windows-x64.nsis.zip.sig` | Minisign signature of the x86_64 zip. |
-| `CPU-Manager_<tag>_windows-arm64.nsis.zip` | Zipped installer used by the in-app updater (aarch64). |
-| `CPU-Manager_<tag>_windows-arm64.nsis.zip.sig` | Minisign signature of the aarch64 zip. |
+| `CPU-Manager_<tag>_windows-x64-updater.exe` | Tauri-signed installer used by the in-app updater (x86_64). |
+| `CPU-Manager_<tag>_windows-x64-updater.exe.sig` | Minisign signature of the x86_64 updater installer. |
+| `CPU-Manager_<tag>_windows-arm64-updater.exe` | Tauri-signed installer used by the in-app updater (aarch64). |
+| `CPU-Manager_<tag>_windows-arm64-updater.exe.sig` | Minisign signature of the aarch64 updater installer. |
 | `latest.json` | Combined update manifest with one entry per Windows architecture. |
 | `SHA256SUMS.txt` | SHA-256 digests of every file above, `sha256sum -c` compatible (LF line endings, no BOM). |
 
@@ -99,11 +99,11 @@ The `latest.json` payload looks like:
   "platforms": {
     "windows-x86_64": {
       "signature": "<minisign signature>",
-      "url": "CPU-Manager_v0.1.0_windows-x64.nsis.zip"
+      "url": "CPU-Manager_v0.1.0_windows-x64-updater.exe"
     },
     "windows-aarch64": {
       "signature": "<minisign signature>",
-      "url": "CPU-Manager_v0.1.0_windows-arm64.nsis.zip"
+      "url": "CPU-Manager_v0.1.0_windows-arm64-updater.exe"
     }
   }
 }
@@ -119,7 +119,7 @@ serves without authentication.
 
 `build.bat` mirrors the CI pipeline. If `src-tauri/tauri.key` is present on
 the build machine, the resulting NSIS bundle directory contains the signed
-`.nsis.zip` and `.sig` files. The script then copies them to a top-level
+signed installer and `.sig` files. The script then copies them to a top-level
 `release/` directory alongside the installer and writes
 `SHA256SUMS.txt` using the same format the release job uses.
 
