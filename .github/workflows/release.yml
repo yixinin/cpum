@@ -124,7 +124,6 @@ jobs:
             $keyPath = Join-Path $env:RUNNER_TEMP 'cpum-tauri.key'
             [System.IO.File]::WriteAllText($keyPath, $env:TAURI_SIGNING_PRIVATE_KEY, [System.Text.UTF8Encoding]::new($false))
             $env:TAURI_SIGNING_PRIVATE_KEY_PATH = $keyPath
-            Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY
             npx tauri build --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.updater.conf.json
           } else {
             npx tauri build --bundles nsis --target ${{ matrix.target }}
