@@ -175,6 +175,9 @@ const messages: Record<Locale, Record<string, string>> = {
     serviceMissing: "服务未安装，安装后可开机自动应用规则。",
     serviceStatusUnknown: "服务状态: {status}",
     serviceDesc: "安装后，进程规则（亲和性与优先级）将在开机时自动应用到匹配的进程。服务以 SYSTEM 身份运行，每 5 秒扫描一次。",
+    serviceElevationHint: "本应用本身以普通权限运行；仅安装/卸载/启停服务需要管理员权限，届时会弹出 UAC 提权提示。",
+    bridgeConnected: "特权通道：已连接（受保护进程可直接经服务修改，无需 UAC）。",
+    bridgeUnavailable: "特权通道：未连接（受保护进程将改为单次 UAC 提权，或需先安装服务）。",
 
     // ---------- Dynamic optimization engine (ProBalance) ----------
     pb: "动态优化",
@@ -435,6 +438,9 @@ const messages: Record<Locale, Record<string, string>> = {
     serviceMissing: "Service is not installed. Install it to apply rules at startup.",
     serviceStatusUnknown: "Service status: {status}",
     serviceDesc: "After installation, process rules (affinity and priorities) are applied to matching processes at startup. The service runs as SYSTEM and scans every 5 seconds.",
+    serviceElevationHint: "The app itself runs un-elevated. Only installing, removing, starting, or stopping the service needs administrator rights, which triggers a UAC prompt.",
+    bridgeConnected: "Privileged bridge: connected (protected processes are changed through the service, no UAC prompt).",
+    bridgeUnavailable: "Privileged bridge: not connected (protected processes fall back to a one-off UAC prompt, or need the service installed).",
 
     // ---------- Dynamic optimization (ProBalance) ----------
     pb: "ProBalance",

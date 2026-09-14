@@ -12,7 +12,13 @@ use std::collections::HashMap;
 use std::mem::size_of;
 
 use windows::core::{w, PCSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, SetLastError, HANDLE, LUID, WIN32_ERROR, ERROR_NOT_ALL_ASSIGNED,
+};
+use windows::Win32::Security::{
+    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_PRIVILEGES, TOKEN_QUERY, SE_PRIVILEGE_ENABLED,
+};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First, Thread32Next,
     PROCESSENTRY32W, THREADENTRY32, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD,
@@ -22,7 +28,8 @@ use windows::Win32::System::SystemInformation::{
     GetSystemCpuSetInformation, CpuSetInformation, GROUP_AFFINITY, SYSTEM_CPU_SET_INFORMATION,
 };
 use windows::Win32::System::Threading::{
-    GetPriorityClass, GetProcessAffinityMask, GetProcessDefaultCpuSets, GetProcessInformation,
+    GetCurrentProcess, GetPriorityClass, GetProcessAffinityMask, GetProcessDefaultCpuSets,
+    GetProcessInformation, OpenProcessToken,
     GetThreadGroupAffinity, OpenProcess, OpenThread, QueryFullProcessImageNameW, SetPriorityClass,
     SetProcessAffinityMask, SetProcessDefaultCpuSets, SetProcessInformation,
     SetThreadGroupAffinity, GetActiveProcessorCount, GetActiveProcessorGroupCount,
@@ -31,6 +38,51 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_LIMITED_INFORMATION,
     THREAD_QUERY_INFORMATION, THREAD_SET_INFORMATION,
 };
+
+// =========================================================================
+// SeDebugPrivilege
+// =========================================================================
+
+/// Enable `SeDebugPrivilege` on the current process.
+///
+/// Required to reliably open processes owned by another account (or running at
+/// a higher integrity level). `LocalSystem` holds the privilege but may start
+/// with it disabled; an elevated administrator token holds it as well. A
+/// standard / filtered UAC token does not, and this call fails for it - which
+/// is exactly why the GUI delegates to the service instead.
+pub fn enable_debug_privilege() -> Result<(), String> {
+    unsafe {
+        let mut token = Default::default();
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+        .map_err(|e| format!("OpenProcessToken: {e}"))?;
+
+        let mut luid = LUID::default();
+        if let Err(error) = LookupPrivilegeValueW(None, w!("SeDebugPrivilege"), &mut luid) {
+            let _ = CloseHandle(token);
+            return Err(format!("LookupPrivilegeValueW(SeDebugPrivilege): {error}"));
+        }
+
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+        };
+        SetLastError(WIN32_ERROR(0));
+        let adjust_result =
+            AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None);
+        let last_error = GetLastError();
+        let _ = CloseHandle(token);
+
+        adjust_result.map_err(|e| format!("AdjustTokenPrivileges: {e}"))?;
+        if last_error == ERROR_NOT_ALL_ASSIGNED {
+            return Err("current account does not hold SeDebugPrivilege".to_string());
+        }
+    }
+    Ok(())
+}
 
 // =========================================================================
 // mask utilities

@@ -19,8 +19,8 @@ CPU Manager 是一款用于查看 CPU 拓扑、浏览 Windows 进程并管理其
 - 规则调度模式：**严格（Strict，硬亲和性）** 或 **软（Soft，CPU Sets，Win10 1803+；负载高峰时调度器可临时漂移到其他核心）**。
 - 规则可同时固定 **CPU 优先级类**、**I/O 优先级** 与 **内存优先级**。ProBalance 会自动将“由规则管理优先级”的进程排除在降级名单之外，避免与规则引擎相互干扰。
 - ProBalance 动态优化：当检测到前台进程 CPU 持续超过阈值时，对超过阈值的后台进程临时降级（CPU 优先级类 + I/O 优先级），并在争用解除、进程退出或功能关闭时自动恢复。GUI 中可查看实时状态、统计数据和 JSONL 行为日志。
-- 可安装 `CpumAffinityService` Windows 服务：该服务随系统自动启动，每 5 秒扫描一次匹配的进程，并同时承载 ProBalance 运行时。
-- 共享规则与 ProBalance 配置保存在 `C:\ProgramData\cpum\`（`affinity_rules.json`、`probalance.json`、日志/状态文件）。安装时会将旧版 per-user 和 Tauri 标识符下的规则文件迁移到该机器级目录。
+- 可安装 `CpumAffinityService` Windows 服务：该服务随系统自动启动，每 5 秒扫描一次匹配的进程，并同时承载 ProBalance 运行时；它同时充当**特权通道**，未提权的前台应用通过命名管道把受保护进程的修改交给它执行，全程无 UAC 弹窗。
+- 规则与 ProBalance 配置保存在每用户数据目录 `%APPDATA%\com.eason.cpum\`（`affinity_rules.json`、`probalance.json`、日志/状态文件）。旧位置（`%ProgramData%\cpum`、`%APPDATA%\cpum`）下的文件会在安装或首次运行时自动迁移。
 
 ## 使用流程
 
@@ -41,7 +41,9 @@ CPU Manager 是一款用于查看 CPU 拓扑、浏览 Windows 进程并管理其
 - Microsoft C++ Build Tools / Visual Studio Build Tools（Rust Windows 工具链所需）
 - WebView2 Runtime（通常已随较新的 Windows 系统提供）
 
-应用会请求管理员权限（桌面可执行文件内嵌 `requireAdministrator` 清单）。某些受 Windows 保护的进程，或属于其他安全上下文的进程，仍可能拒绝亲和性或优先级修改。
+桌面应用以调用者的普通权限运行（可执行文件内嵌 `asInvoker` 清单），安装包为 per-user NSIS 安装包，默认安装到 `%LOCALAPPDATA%`，安装过程无需 UAC 弹窗。只有 Windows 服务的管理操作（安装/卸载/启动/停止）需要管理员权限：这些命令会通过提权辅助进程执行，因此仅在该操作时弹出一次 UAC 提示。
+
+由于前台应用不再提权，某些受 Windows 保护的进程，或属于其他安全上下文的进程，仍可能拒绝亲和性或优先级修改；安装以 `LocalSystem` 运行的服务即可覆盖这些场景。
 
 ## 开发
 
@@ -67,7 +69,7 @@ cargo check
 
 ## 生产构建
 
-发布脚本会刷新应用图标、构建前端、从 workspace 编译 `cpum_service.exe`，并生成面向整台电脑安装的 NSIS 安装程序：
+发布脚本会刷新应用图标、构建前端、从 workspace 编译 `cpum_service.exe`，并生成 per-user（当前用户）NSIS 安装程序：
 
 ```powershell
 .\build.bat
@@ -96,7 +98,7 @@ npx tauri build --bundles nsis
 规则文件使用 v2 信封格式，保存位置：
 
 ```text
-C:\ProgramData\cpum\affinity_rules.json
+%APPDATA%\com.eason.cpum\affinity_rules.json
 ```
 
 磁盘上的格式：
@@ -131,22 +133,35 @@ C:\ProgramData\cpum\affinity_rules.json
 
 ### Windows 服务
 
-应用可安装、启动、停止和卸载 `CpumAffinityService`。该服务以 `LocalSystem` 身份运行、自动启动，安装时会收到共享规则目录参数（`C:\ProgramData\cpum`），并同时承载规则引擎与 ProBalance 运行时。服务会尝试启用 `SeDebugPrivilege`，以便向用户会话中的进程应用规则。
+应用可安装、启动、停止和卸载 `CpumAffinityService`。该服务以 `LocalSystem` 身份运行、自动启动，安装时会收到规则目录参数（`%APPDATA%\com.eason.cpum`），并同时承载规则引擎与 ProBalance 运行时。服务会尝试启用 `SeDebugPrivilege`，以便向用户会话中的进程应用规则。
 
-可在提升权限的 PowerShell 中验证服务安装状态：
+提权范围仅限该操作：应用通过提权辅助进程调用 `sc.exe`，因此安装或卸载服务时只会弹出一次 UAC 提示，其余功能仍以普通权限运行。
+
+可在 PowerShell 中验证服务安装状态：
 
 ```powershell
 sc.exe qc CpumAffinityService
 sc.exe query CpumAffinityService
-Get-Content C:\ProgramData\cpum\affinity_rules.json
+Get-Content "$env:APPDATA\com.eason.cpum\affinity_rules.json"
 ```
 
 `Running` 仅表示服务正在运行，不能证明规则匹配到了进程，也不能证明 Windows 接受了亲和性掩码。排查问题时，请确认服务可执行文件路径与参数、规则文件以及目标进程的实际亲和性。
 
+### 受保护进程的特权操作
+
+前台应用以普通权限运行，对"属于其他账户"或"完整性级别更高"的进程调用 `OpenProcess` 会被拒绝（UAC 过滤令牌不含 `SeDebugPrivilege`）。此时按两级升级：
+
+1. **服务通道（首选）** —— 请求通过命名管道 `\\.\pipe\cpum-bridge-v1` 转发给 `CpumAffinityService`。该服务以 `LocalSystem` 运行并持有 `SeDebugPrivilege`，因此完全无弹窗即可完成修改。**应用规则**中 GUI 处理不了的进程也会走这条路径。
+2. **一次性提权（兜底）** —— 未安装服务时，用 `--set-affinity` / `--set-priority` 参数提权重启随包的 `cpum_service.exe`，那一次修改会弹一次 UAC。若某 PID 连这样都失败（PPL / 受保护的反作弊进程），本会话内将不再对它重复弹窗。
+
+鉴权：管道 DACL 允许 SYSTEM 与交互式用户，但每个请求都必须带上随机令牌，令牌存放于 `%APPDATA%\com.eason.cpum\bridge.token`，只有该用户（和 SYSTEM）能读。其他本地用户可以连上管道，但拿不到合法令牌。
+
+注意 **PPL 进程根本无法修改**（管理员提权也不行），这类操作必定失败，错误会原样返回。
+
 如需对规则进行一次性的诊断应用，可执行已安装的服务程序：
 
 ```powershell
-& "<cpum_service.exe 的路径>" --apply-once C:\ProgramData\cpum
+& "<cpum_service.exe 的路径>" --apply-once "$env:APPDATA\com.eason.cpum"
 ```
 
 ## 项目结构
@@ -166,7 +181,7 @@ src-tauri/                        Tauri 桌面二进制
   crates/
     cpum-core/                    规则模型、匹配器、存储、ProBalance、procwin
     cpum-service/                 cpum_service.exe（Windows 服务 + ProBalance 运行时）
-  installer-hooks.nsh             NSIS 安装钩子：将旧版规则文件迁移到 %ProgramData%
+  installer-hooks.nsh             NSIS 安装钩子：迁移旧版规则文件，仅服务操作提权
 build.bat                         NSIS 发布构建脚本
 ```
 

@@ -316,17 +316,25 @@ export async function getProBalanceStatistics(): Promise<PbStatistics> {
 /** Service status */
 export type ServiceStatus = "running" | "stopped" | "not_installed" | string;
 
+/** Privileged bridge reachability */
+export type BridgeStatus = "connected" | "unavailable" | string;
+
 /** Query the service status */
 export async function getServiceStatus(): Promise<ServiceStatus> {
   return await invoke<ServiceStatus>("get_service_status");
 }
 
-/** Install the service and set it to auto-start (requires admin) */
+/** Whether the privileged bridge to the LocalSystem service is reachable */
+export async function getBridgeStatus(): Promise<BridgeStatus> {
+  return await invoke<BridgeStatus>("get_bridge_status");
+}
+
+/** Install the service and set it to auto-start (the sc.exe calls are elevated via UAC) */
 export async function installService(): Promise<string> {
   return await invoke<string>("install_service");
 }
 
-/** Uninstall the service (requires admin) */
+/** Uninstall the service (the sc.exe calls are elevated via UAC) */
 export async function uninstallService(): Promise<string> {
   return await invoke<string>("uninstall_service");
 }

@@ -9,9 +9,12 @@ mod topology;
 
 use models::{mask_to_hex, CpuTopology, ProcessInfo};
 use cpum_core::rule::{AffinityRule, MatchType, RuleMode};
+use once_cell::sync::Lazy;
+use std::collections::HashSet;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
 use tauri::{Emitter, Manager, Runtime};
 use uuid::Uuid;
 
@@ -20,14 +23,54 @@ fn get_process_exe_path(pid: u32) -> Option<String> {
     cpum_core::procwin::get_process_exe_path(pid)
 }
 
-#[tauri::command]
-fn set_process_priority<R: Runtime>(
-    app: tauri::AppHandle<R>, pid: u32, priority_class: Option<u32>, io_priority: Option<u32>, memory_priority: Option<u32>,
+fn apply_priorities_locally(
+    pid: u32, priority_class: Option<u32>, io_priority: Option<u32>, memory_priority: Option<u32>,
 ) -> Result<(), String> {
     if let Some(value) = priority_class { cpum_core::procwin::set_process_priority_class(pid, value)?; }
     if let Some(value) = io_priority { cpum_core::procwin::set_process_io_priority(pid, value)?; }
     if let Some(value) = memory_priority { cpum_core::procwin::set_process_memory_priority(pid, value)?; }
-    let current = cpum_core::procwin::get_process_priorities(pid);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_process_priority<R: Runtime>(
+    app: tauri::AppHandle<R>, pid: u32, priority_class: Option<u32>, io_priority: Option<u32>, memory_priority: Option<u32>,
+) -> Result<(), String> {
+    let mut failure = apply_priorities_locally(pid, priority_class, io_priority, memory_priority).err();
+    let mut privileged_result: Option<cpum_core::procwin::ProcessPriorities> = None;
+
+    if let Some(error) = &failure {
+        if is_access_denied_error(error) {
+            match bridge_set_priority(&app, pid, priority_class, io_priority, memory_priority) {
+                Ok(response) => {
+                    privileged_result = response.priorities;
+                    failure = None;
+                }
+                Err(bridge_error) => {
+                    if !elevation_failed(pid) {
+                        match elevated_set_priority(pid, priority_class, io_priority, memory_priority) {
+                            Ok(()) => failure = None,
+                            Err(elevated_error) => {
+                                mark_elevation_failed(pid);
+                                failure = Some(format!(
+                                    "{error}\nvia service: {bridge_error}\nvia elevation: {elevated_error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(error) = failure {
+        return Err(error);
+    }
+
+    // Prefer the values the service read back; reading them locally would fail
+    // for exactly the processes that needed the service in the first place.
+    let current = privileged_result
+        .unwrap_or_else(|| cpum_core::procwin::get_process_priorities(pid));
     let _ = app.emit("process://priority-updated", serde_json::json!({ "pid": pid, "priority_class": current.priority_class, "io_priority": current.io_priority, "memory_priority": current.memory_priority }));
     Ok(())
 }
@@ -75,6 +118,166 @@ fn list_processes_cached<R: Runtime>(
     Ok(process::load_processes_cache(&cache_dir).unwrap_or_default())
 }
 
+// ---------- Privileged fallback ----------
+// The app runs un-elevated, so it cannot modify processes owned by another
+// account or running at a higher integrity level: OpenProcess fails with
+// ERROR_ACCESS_DENIED because a filtered UAC token does not hold
+// SeDebugPrivilege. Two escalation paths exist, tried in this order:
+//   1. the LocalSystem service (already running -> no prompt at all);
+//   2. a one-shot elevated launch of the bundled service binary (one UAC
+//      prompt, only when the service is not installed).
+// Processes that even SYSTEM may not touch (PPL / protected anti-cheat) still
+// fail; those PIDs are remembered so we do not prompt again for them.
+
+static ELEVATION_FAILED: Lazy<Mutex<HashSet<u32>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+fn elevation_failed(pid: u32) -> bool {
+    ELEVATION_FAILED.lock().map(|set| set.contains(&pid)).unwrap_or(false)
+}
+
+fn mark_elevation_failed(pid: u32) {
+    if let Ok(mut set) = ELEVATION_FAILED.lock() {
+        set.insert(pid);
+    }
+}
+
+/// Win32 reports a refused open as `ERROR_ACCESS_DENIED` (5); windows-rs
+/// formats it as `Access is denied. (0x80070005)`.
+fn is_access_denied_error(message: &str) -> bool {
+    message.contains("0x80070005") || message.contains("Access is denied")
+}
+
+fn bridge_token<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<String, String> {
+    cpum_core::ipc::ensure_token(&rules_dir(app)?)
+}
+
+fn bridge_response(response: cpum_core::ipc::Response) -> Result<cpum_core::ipc::Response, String> {
+    if response.ok {
+        Ok(response)
+    } else {
+        Err(response.error.unwrap_or_else(|| "service bridge refused the request".to_string()))
+    }
+}
+
+/// Delegate a single affinity change to the LocalSystem service.
+fn bridge_set_affinity<R: Runtime>(
+    app: &tauri::AppHandle<R>, pid: u32, masks: &[String], mode: RuleMode,
+) -> Result<(), String> {
+    let request = cpum_core::ipc::Request::SetAffinity {
+        token: bridge_token(app)?,
+        pid,
+        masks: masks.to_vec(),
+        mode,
+    };
+    bridge_response(cpum_core::ipc::request(&request)?).map(|_| ())
+}
+
+/// Delegate one or more priority changes to the LocalSystem service.
+fn bridge_set_priority<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    pid: u32,
+    priority_class: Option<u32>,
+    io_priority: Option<u32>,
+    memory_priority: Option<u32>,
+) -> Result<cpum_core::ipc::Response, String> {
+    let request = cpum_core::ipc::Request::SetPriority {
+        token: bridge_token(app)?,
+        pid,
+        priority_class,
+        io_priority,
+        memory_priority,
+    };
+    bridge_response(cpum_core::ipc::request(&request)?)
+}
+
+/// Ask the service to re-apply every enabled rule.
+fn bridge_apply_rules<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<cpum_core::ipc::Response, String> {
+    let request = cpum_core::ipc::Request::ApplyRules { token: bridge_token(app)? };
+    bridge_response(cpum_core::ipc::request(&request)?)
+}
+
+/// Re-launch the bundled service binary elevated for a single operation.
+/// This is the last-resort path: it shows one UAC prompt.
+fn run_elevated_helper(arguments: &[String], description: &str) -> Result<String, String> {
+    let helper = service_exe_path()?;
+    let temp_bat = std::env::temp_dir().join(format!("cpum_elevate_{}.bat", Uuid::new_v4()));
+    let temp_log = temp_bat.with_extension("log");
+
+    let command_line = std::iter::once(format!("\"{}\"", helper.display()))
+        .chain(arguments.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let bat_content = format!(
+        "@echo off\r\n{command_line} > \"{log}\" 2>&1\r\nexit /b %errorlevel%\r\n",
+        log = temp_log.display()
+    );
+    std::fs::write(&temp_bat, bat_content)
+        .map_err(|e| format!("failed to create temp script: {e}"))?;
+
+    let escaped_bat = temp_bat.display().to_string().replace('\'', "''");
+    let ps_cmd = format!(
+        "$p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', '{escaped_bat}' -Verb RunAs -Wait -PassThru; exit $p.ExitCode"
+    );
+    let output = run_command_with_deadline(
+        Command::new("powershell.exe").args(["-NoProfile", "-Command", &ps_cmd]),
+        description,
+        ELEVATION_TIMEOUT,
+    );
+    let script_output = std::fs::read(&temp_log)
+        .map(|bytes| decode_console_output(&bytes).trim().to_string())
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&temp_bat);
+    let _ = std::fs::remove_file(&temp_log);
+
+    let output = output?;
+    if output.status.success() {
+        Ok(script_output)
+    } else {
+        Err(if script_output.is_empty() {
+            command_output_text(&output)
+        } else {
+            script_output
+        })
+    }
+}
+
+fn elevated_set_affinity(pid: u32, masks: &[String], mode: RuleMode) -> Result<(), String> {
+    let mode_text = match mode {
+        RuleMode::Soft => "soft",
+        _ => "strict",
+    };
+    run_elevated_helper(
+        &[
+            "--set-affinity".to_string(),
+            pid.to_string(),
+            masks.join(","),
+            mode_text.to_string(),
+        ],
+        "elevated affinity change",
+    )
+    .map(|_| ())
+}
+
+fn elevated_set_priority(
+    pid: u32,
+    priority_class: Option<u32>,
+    io_priority: Option<u32>,
+    memory_priority: Option<u32>,
+) -> Result<(), String> {
+    let text = |value: Option<u32>| value.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+    run_elevated_helper(
+        &[
+            "--set-priority".to_string(),
+            pid.to_string(),
+            text(priority_class),
+            text(io_priority),
+            text(memory_priority),
+        ],
+        "elevated priority change",
+    )
+    .map(|_| ())
+}
+
 /// Set the CPU affinity mask of the specified process.
 /// `mask` is passed as a hex string (e.g. "0xFF") to support the all-ones
 /// 64-bit case.
@@ -86,17 +289,47 @@ fn set_process_affinity<R: Runtime>(
     mode: Option<RuleMode>,
     group_masks: Option<Vec<String>>,
 ) -> Result<(), String> {
+    let mode = mode.unwrap_or_default();
+    let hex_masks: Vec<String> = group_masks.clone().unwrap_or_else(|| vec![mask.clone()]);
     let masks = match group_masks {
         Some(values) => cpum_core::procwin::GroupMasks::from_hex_list(&values)?.0,
         None => vec![cpum_core::procwin::parse_hex_mask(&mask)?],
     };
-    cpum_core::procwin::set_affinity_by_group_masks(pid, &masks, mode.unwrap_or_default())?;
-    // On success, push an event to the frontend immediately so it can patch
-    // the corresponding row's mask in place without a full table refresh.
-    let new_mask_hex = masks.first().copied().map(mask_to_hex);
-    let payload = process::build_affinity_updated_event(pid, new_mask_hex);
-    let _ = app.emit("process://affinity-updated", payload);
-    Ok(())
+
+    let mut failure = cpum_core::procwin::set_affinity_by_group_masks(pid, &masks, mode).err();
+
+    if let Some(error) = &failure {
+        if is_access_denied_error(error) {
+            match bridge_set_affinity(&app, pid, &hex_masks, mode) {
+                Ok(()) => failure = None,
+                Err(bridge_error) => {
+                    if !elevation_failed(pid) {
+                        match elevated_set_affinity(pid, &hex_masks, mode) {
+                            Ok(()) => failure = None,
+                            Err(elevated_error) => {
+                                // Remember the PID: a protected process would
+                                // otherwise trigger a UAC prompt on every retry.
+                                mark_elevation_failed(pid);
+                                failure = Some(format!(
+                                    "{error}\nvia service: {bridge_error}\nvia elevation: {elevated_error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let Some(error) = failure else {
+        // On success, push an event to the frontend immediately so it can patch
+        // the corresponding row's mask in place without a full table refresh.
+        let new_mask_hex = masks.first().copied().map(mask_to_hex);
+        let payload = process::build_affinity_updated_event(pid, new_mask_hex);
+        let _ = app.emit("process://affinity-updated", payload);
+        return Ok(());
+    };
+    Err(error)
 }
 
 // ---------- Metrics staged push stream ----------
@@ -165,14 +398,32 @@ fn affinity_rules_path(base_dir: &PathBuf) -> PathBuf {
     base_dir.join("affinity_rules.json")
 }
 
-/// Rules are shared between the elevated desktop app and the LocalSystem
-/// service, so they must live in a machine-level directory and cannot use
-/// the service account's own APPDATA.
-fn machine_rules_dir() -> PathBuf {
-    std::env::var_os("PROGRAMDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join("cpum")
+/// Rules and ProBalance state live in the per-user Tauri data directory
+/// (`%APPDATA%\<bundle identifier>`). The desktop app runs un-elevated
+/// (`asInvoker`), so it must never write to machine-level locations such as
+/// `%ProgramData%`. The Windows service receives this directory as its startup
+/// argument and runs as `LocalSystem`, which can read it directly.
+fn rules_dir<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("failed to get app data dir: {e}"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create rules directory: {e}"))?;
+    Ok(dir)
+}
+
+/// Read-only fallback sources from older releases. They are only used to
+/// migrate existing data into the current per-user directory, never written to.
+fn legacy_rules_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        dirs.push(PathBuf::from(appdata).join("cpum"));
+    }
+    if let Some(program_data) = std::env::var_os("PROGRAMDATA") {
+        dirs.push(PathBuf::from(program_data).join("cpum"));
+    }
+    dirs
 }
 
 #[tauri::command]
@@ -181,48 +432,49 @@ fn get_logical_processor_usage() -> Result<Vec<process::LogicalProcessorUsage>, 
 }
 
 #[tauri::command]
-fn get_probalance_config() -> Result<cpum_core::probalance::ProBalanceConfig, String> {
-    cpum_core::probalance::load_config(&machine_rules_dir())
+fn get_probalance_config<R: Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<cpum_core::probalance::ProBalanceConfig, String> {
+    cpum_core::probalance::load_config(&rules_dir(&app)?)
 }
 
 #[tauri::command]
-fn save_probalance_config(config: cpum_core::probalance::ProBalanceConfig) -> Result<(), String> {
-    cpum_core::probalance::save_config(&machine_rules_dir(), &config)
+fn save_probalance_config<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    config: cpum_core::probalance::ProBalanceConfig,
+) -> Result<(), String> {
+    cpum_core::probalance::save_config(&rules_dir(&app)?, &config)
 }
 
 #[tauri::command]
-fn get_probalance_status() -> Option<cpum_core::probalance::PbStatus> {
-    cpum_core::probalance::read_status(&machine_rules_dir())
+fn get_probalance_status<R: Runtime>(app: tauri::AppHandle<R>) -> Option<cpum_core::probalance::PbStatus> {
+    cpum_core::probalance::read_status(&rules_dir(&app).ok()?)
 }
 
 #[tauri::command]
-fn get_probalance_log(limit: usize) -> Vec<cpum_core::probalance::PbLogEntry> {
-    cpum_core::probalance::read_log(&machine_rules_dir(), limit.min(500))
+fn get_probalance_log<R: Runtime>(app: tauri::AppHandle<R>, limit: usize) -> Vec<cpum_core::probalance::PbLogEntry> {
+    let Some(dir) = rules_dir(&app).ok() else {
+        return Vec::new();
+    };
+    cpum_core::probalance::read_log(&dir, limit.min(500))
 }
 
 #[tauri::command]
-fn get_probalance_statistics() -> cpum_core::probalance::PbStatistics {
-    cpum_core::probalance::statistics(&machine_rules_dir())
-}
-
-fn app_rules_dir<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
-        .map_err(|e| format!("failed to get app_data_dir: {e}"))
-}
-
-fn legacy_rules_dir() -> Option<PathBuf> {
-    std::env::var("APPDATA").ok().map(|appdata| PathBuf::from(appdata).join("cpum"))
+fn get_probalance_statistics<R: Runtime>(app: tauri::AppHandle<R>) -> cpum_core::probalance::PbStatistics {
+    let Some(dir) = rules_dir(&app).ok() else {
+        return Default::default();
+    };
+    cpum_core::probalance::statistics(&dir)
 }
 
 /// Save the affinity rule list.
 #[tauri::command]
 fn save_affinity_rules<R: Runtime>(
-    _app: tauri::AppHandle<R>,
+    app: tauri::AppHandle<R>,
     rules: Vec<AffinityRule>,
 ) -> Result<(), String> {
     for rule in &rules { cpum_core::rule::validate_rule(rule)?; }
-    cpum_core::store::save_rules(&machine_rules_dir(), &rules)
+    cpum_core::store::save_rules(&rules_dir(&app)?, &rules)
 }
 
 /// Load the affinity rule list.
@@ -230,19 +482,12 @@ fn save_affinity_rules<R: Runtime>(
 fn load_affinity_rules<R: Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<Vec<AffinityRule>, String> {
-    let rules_dir = machine_rules_dir();
-    let primary_path = affinity_rules_path(&rules_dir);
+    let primary_path = affinity_rules_path(&rules_dir(&app)?);
     let (path, raw) = match std::fs::read_to_string(&primary_path) {
-        Ok(raw) => (primary_path, raw),
+        Ok(raw) => (primary_path.clone(), raw),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let app_dir = app_rules_dir(&app)?;
-            let mut legacy_paths = vec![affinity_rules_path(&app_dir)];
-            if let Some(legacy_dir) = legacy_rules_dir() {
-                legacy_paths.push(affinity_rules_path(&legacy_dir));
-            }
-
             let mut found = None;
-            for legacy_path in legacy_paths {
+            for legacy_path in legacy_rules_dirs().iter().map(affinity_rules_path) {
                 match std::fs::read_to_string(&legacy_path) {
                     Ok(raw) => {
                         found = Some((legacy_path, raw));
@@ -261,9 +506,9 @@ fn load_affinity_rules<R: Runtime>(
     };
     let rules = cpum_core::store::parse_rules(&raw)?;
 
-    // When rules are first read from a legacy location, migrate them to the
-    // machine-level directory that the service can read directly.
-    if path != affinity_rules_path(&rules_dir) {
+    // When rules are read from a legacy location, migrate them into the
+    // per-user directory that the service is pointed at.
+    if path != primary_path {
         save_affinity_rules(app, rules.clone())?;
     }
 
@@ -336,13 +581,39 @@ fn apply_affinity_rules<R: Runtime>(
 ) -> Result<u32, String> {
     let rules = load_affinity_rules(app.clone())?;
     let report = cpum_core::engine::apply_rules(&rules)?;
+    let mut applied = report.applied;
+    let mut handled: HashSet<u32> = HashSet::new();
     for changed in report.changed {
+        handled.insert(changed.pid);
         let _ = app.emit("process://affinity-updated", process::build_affinity_updated_event(changed.pid, changed.mask_hex));
         if let Some(priorities) = changed.priorities {
             let _ = app.emit("process://priority-updated", serde_json::json!({ "pid": changed.pid, "priority_class": priorities.priority_class, "io_priority": priorities.io_priority, "memory_priority": priorities.memory_priority }));
         }
     }
-    Ok(report.applied)
+
+    // Processes the un-elevated app could not open are re-applied by the
+    // service (best effort - it is an optional component). This path is
+    // deliberately not backed by a UAC prompt: a batch operation should not
+    // raise one per protected process, and the per-process editor already
+    // offers elevation for individual PIDs.
+    if report.failed > 0 {
+        if let Ok(response) = bridge_apply_rules(&app) {
+            if let Some(changed) = response.changed {
+                for entry in changed {
+                    if !handled.insert(entry.pid) {
+                        continue;
+                    }
+                    applied += 1;
+                    let _ = app.emit("process://affinity-updated", process::build_affinity_updated_event(entry.pid, entry.mask_hex));
+                    if let Some(priorities) = entry.priorities {
+                        let _ = app.emit("process://priority-updated", serde_json::json!({ "pid": entry.pid, "priority_class": priorities.priority_class, "io_priority": priorities.io_priority, "memory_priority": priorities.memory_priority }));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(applied)
 }
 
 /// Auto-generate a unique ID for an affinity rule.
@@ -386,16 +657,25 @@ fn service_exe_path() -> Result<PathBuf, String> {
 
 const SERVICE_NAME: &str = "CpumAffinityService";
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// An elevated launch waits for the user to react to the UAC prompt, which can
+/// easily take longer than the short timeout used for plain `sc.exe` queries.
+const ELEVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn run_command_with_timeout(command: &mut Command, description: &str) -> Result<Output, String> {
+    run_command_with_deadline(command, description, COMMAND_TIMEOUT)
+}
+
+fn run_command_with_deadline(
+    command: &mut Command, description: &str, timeout: std::time::Duration,
+) -> Result<Output, String> {
     command.creation_flags(CREATE_NO_WINDOW);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to start {description}: {e}"))?;
-    let deadline = std::time::Instant::now() + COMMAND_TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
 
     loop {
         if child
@@ -410,7 +690,7 @@ fn run_command_with_timeout(command: &mut Command, description: &str) -> Result<
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("{description} timed out ({} seconds)", COMMAND_TIMEOUT.as_secs()));
+            return Err(format!("{description} timed out ({} seconds)", timeout.as_secs()));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -476,21 +756,17 @@ fn run_elevated_sc(command: &str, description: &str) -> Result<Output, String> {
 }
 
 /// Get the affinity rules directory (passed to the service as a startup arg).
-fn rules_dir_string() -> Result<String, String> {
-    let dir = machine_rules_dir();
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("failed to create rules directory: {e}"))?;
-    }
-    Ok(dir.to_string_lossy().into_owned())
+fn rules_dir_string<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<String, String> {
+    Ok(rules_dir(app)?.to_string_lossy().into_owned())
 }
 
 /// Install cpum_service as a Windows service (auto-start).
-/// Requires administrator privileges (the app is already running elevated).
+/// The app itself runs un-elevated, so the sc.exe calls are relaunched
+/// through an elevated helper (which shows a UAC prompt).
 #[tauri::command]
-fn install_service<R: Runtime>(_app: tauri::AppHandle<R>) -> Result<String, String> {
+fn install_service<R: Runtime>(app: tauri::AppHandle<R>) -> Result<String, String> {
     let svc_path = service_exe_path()?;
-    let rules_dir = rules_dir_string()?;
+    let rules_dir = rules_dir_string(&app)?;
 
     // sc.exe needs the full command line as the binPath value; the inner
     // double quotes must be escaped, otherwise install paths containing
@@ -561,8 +837,8 @@ fn install_service<R: Runtime>(_app: tauri::AppHandle<R>) -> Result<String, Stri
     Ok("service installed and started. It will auto-run on boot; no need to keep the app open.".to_string())
 }
 
-/// Uninstall the cpum_service.
-/// Requires administrator privileges (the app is already running elevated).
+/// Uninstall the cpum_service. The sc.exe calls are relaunched elevated when
+/// the un-elevated attempt is refused with access denied.
 #[tauri::command]
 fn uninstall_service() -> Result<String, String> {
     if query_service_status()? == "not_installed" {
@@ -610,6 +886,20 @@ fn uninstall_service() -> Result<String, String> {
     }
 
     Ok("service uninstalled.".to_string())
+}
+
+/// Whether the privileged bridge to the LocalSystem service is reachable.
+/// Returns "connected" or "unavailable"; when connected, operations on
+/// protected / other-session processes work without any UAC prompt.
+#[tauri::command]
+fn get_bridge_status<R: Runtime>(app: tauri::AppHandle<R>) -> String {
+    let Ok(token) = bridge_token(&app) else {
+        return "unavailable".to_string();
+    };
+    match cpum_core::ipc::request(&cpum_core::ipc::Request::Ping { token }) {
+        Ok(response) if response.ok => "connected".to_string(),
+        _ => "unavailable".to_string(),
+    }
 }
 
 /// Query the service status. Returns one of:
@@ -736,6 +1026,7 @@ pub fn run() {
             install_service,
             uninstall_service,
             get_service_status,
+            get_bridge_status,
             start_service,
             stop_service,
         ])

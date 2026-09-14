@@ -19,8 +19,8 @@ CPU Manager is a Windows desktop application for inspecting CPU topology, browsi
 - Rule scheduling mode: **Strict** (hard `SetProcessAffinityMask`) or **Soft** (`SetProcessDefaultCpuSets`, Win10 1803+; the scheduler may temporarily drift the process to other cores under load).
 - Rules may also pin **CPU priority class**, **I/O priority**, and **memory priority**. ProBalance automatically excludes processes whose priorities are managed by a rule so the two engines do not fight.
 - ProBalance dynamic optimization: when the foreground process's CPU stays above a configurable threshold, background processes that exceed a CPU threshold are temporarily downgraded (priority class + I/O priority) and restored automatically once contention clears, the process exits, or the feature is disabled. The status, statistics, and JSONL journal are exposed in the GUI.
-- Install an optional `CpumAffinityService` Windows service that starts automatically and scans for matching processes every five seconds. The same service hosts the ProBalance runtime.
-- Persist shared rules and ProBalance configuration in `C:\ProgramData\cpum\` (`affinity_rules.json`, `probalance.json`, journal/status files). Per-user and Tauri identifier rule locations are migrated to the machine-level directory on install.
+- Install an optional `CpumAffinityService` Windows service that starts automatically and scans for matching processes every five seconds. The same service hosts the ProBalance runtime, and doubles as a **privileged bridge**: the un-elevated GUI delegates changes to protected processes to it over a named pipe, so no UAC prompt is needed.
+- Persist rules and ProBalance configuration in the per-user data directory `%APPDATA%\com.eason.cpum\` (`affinity_rules.json`, `probalance.json`, journal/status files). Legacy locations (`%ProgramData%\cpum`, `%APPDATA%\cpum`) are migrated on first run or install.
 
 ## Screens and workflow
 
@@ -43,7 +43,9 @@ For development:
 - Microsoft C++ Build Tools / Visual Studio Build Tools (required by the Rust Windows toolchain)
 - WebView2 Runtime (normally included with current Windows installations)
 
-The app requests administrator privileges (the desktop binary embeds a `requireAdministrator` manifest). Some processes are protected by Windows or belong to another security context and may still reject affinity or priority changes.
+The desktop app runs with the privileges of the invoking user (the binary embeds an `asInvoker` manifest) and the installer is a per-user NSIS installer that installs into `%LOCALAPPDATA%` without a UAC prompt. Only Windows service management (install / uninstall / start / stop) needs administrator rights: those commands are re-launched through an elevated helper, so a single UAC prompt appears for that action only.
+
+Because the app is un-elevated, some processes are protected by Windows or belong to another security context and may reject affinity or priority changes; install the service (which runs as `LocalSystem`) to cover those cases.
 
 ## Development
 
@@ -69,7 +71,7 @@ cargo check
 
 ## Production build
 
-The release script refreshes the application icons, builds the frontend, compiles `cpum_service.exe` from the workspace, and produces a per-machine NSIS installer:
+The release script refreshes the application icons, builds the frontend, compiles `cpum_service.exe` from the workspace, and produces a per-user NSIS installer:
 
 ```powershell
 .\build.bat
@@ -98,7 +100,7 @@ npx tauri build --bundles nsis
 Rule files use a v2 envelope and live at:
 
 ```text
-C:\ProgramData\cpum\affinity_rules.json
+%APPDATA%\com.eason.cpum\affinity_rules.json
 ```
 
 The on-disk format:
@@ -133,22 +135,35 @@ The on-disk format:
 
 ### Windows service
 
-The application can install, start, stop, and uninstall the `CpumAffinityService` service. The service runs as `LocalSystem`, starts automatically, receives the shared rule directory (`C:\ProgramData\cpum`) when installed, and hosts both the rule engine and the ProBalance runtime. It attempts to enable `SeDebugPrivilege` so it can apply rules to processes in user sessions.
+The application can install, start, stop, and uninstall the `CpumAffinityService` service. The service runs as `LocalSystem`, starts automatically, receives the rule directory (`%APPDATA%\com.eason.cpum`) when installed, and hosts both the rule engine and the ProBalance runtime. It attempts to enable `SeDebugPrivilege` so it can apply rules to processes in user sessions.
 
-To verify an installation from an elevated PowerShell prompt:
+Elevation is scoped to this action: the app calls `sc.exe` through an elevated helper, so installing or removing the service shows one UAC prompt while the rest of the app keeps running un-elevated.
+
+To verify an installation from a PowerShell prompt:
 
 ```powershell
 sc.exe qc CpumAffinityService
 sc.exe query CpumAffinityService
-Get-Content C:\ProgramData\cpum\affinity_rules.json
+Get-Content "$env:APPDATA\com.eason.cpum\affinity_rules.json"
 ```
 
 `Running` only confirms that the service is running; it does not prove that a rule matched a process or that Windows accepted its affinity mask. Confirm the service binary path and arguments, the rule file, and the target process affinity when troubleshooting.
 
+### Privileged operations (protected processes)
+
+The desktop app runs un-elevated, so `OpenProcess` is refused for processes owned by another account or running at a higher integrity level (a filtered UAC token does not hold `SeDebugPrivilege`). When that happens the app escalates in two steps:
+
+1. **Service bridge** (preferred) — the request is forwarded to `CpumAffinityService` over the named pipe `\\.\pipe\cpum-bridge-v1`. The service runs as `LocalSystem` with `SeDebugPrivilege`, so the change is applied with no prompt at all. **Apply Rules** also uses this path for the processes the GUI could not handle.
+2. **One-off elevation** (fallback) — when the service is not installed, the bundled `cpum_service.exe` is re-launched elevated with `--set-affinity` / `--set-priority`, which raises a single UAC prompt for that one change. A PID that fails even then (PPL / protected anti-cheat) is remembered for the session so it does not prompt again.
+
+Authorization: the pipe DACL allows SYSTEM and interactive users, but every request must carry a random token stored in `%APPDATA%\com.eason.cpum\bridge.token` — a file only that user (and SYSTEM) can read. A different local user can open the pipe but cannot produce a valid token.
+
+Note that **PPL processes cannot be modified at all** (not even by an elevated administrator); those will always fail, and the error is surfaced as-is.
+
 For a one-time diagnostic application of the rules, run the installed service executable with:
 
 ```powershell
-& "<path-to-cpum_service.exe>" --apply-once C:\ProgramData\cpum
+& "<path-to-cpum_service.exe>" --apply-once "$env:APPDATA\com.eason.cpum"
 ```
 
 ## Auto-update and release signing
@@ -175,9 +190,10 @@ src-tauri/                        Tauri desktop binary
     process/                      Process enumeration, metrics, sampling
     topology.rs                   CPU topology detection
   crates/
-    cpum-core/                    Rule model, matcher, store, ProBalance, procwin
-    cpum-service/                 cpum_service.exe (Windows service + ProBalance runtime)
-  installer-hooks.nsh             NSIS hooks: migrate legacy rule files to %ProgramData%
+    cpum-core/                    Rule model, matcher, store, ProBalance, procwin, IPC bridge
+    cpum-service/                 cpum_service.exe (Windows service + ProBalance runtime
+                                  + privileged bridge server + one-shot elevated helper)
+  installer-hooks.nsh             NSIS hooks: migrate legacy rule files, elevate only for service ops
   tauri.pubkey                    Committed updater public key (private key is gitignored)
 docs/
   UPDATER.md                      Key management, release artifacts, verification

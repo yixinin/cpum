@@ -22,6 +22,11 @@
 //! that `tauri_build::try_build` does not run its build script (and therefore
 //! does not validate the bundled `cpum_service.exe` resource) when only the
 //! service binary is being compiled.
+//!
+//! Besides the daemon, the binary doubles as a one-shot privileged helper:
+//! when the GUI runs without the service installed it re-launches this binary
+//! elevated with `--set-affinity` / `--set-priority`, so a single UAC prompt
+//! can still cover protected processes.
 
 use std::ffi::OsString;
 use std::time::Duration;
@@ -39,71 +44,15 @@ use cpum_core::probalance::ProBalanceRuntime;
 use cpum_core::rule::AffinityRule;
 
 const SERVICE_NAME: &str = "CpumAffinityService";
-const RULES_DIR: &str = r"C:\ProgramData\cpum";
+// Legacy machine-level directory, only used when the service is started
+// without the rules directory argument (the desktop app always passes the
+// per-user directory `%APPDATA%\com.eason.cpum` when installing the service).
+const LEGACY_RULES_DIR: &str = r"C:\ProgramData\cpum";
 
 /// Main loop tick interval (seconds) - ProBalance decision granularity.
 const TICK_INTERVAL_SECS: u64 = 1;
 /// Rule application interval (in ticks) - keeps the original 5-second cadence.
 const RULE_APPLY_TICKS: u64 = 5;
-
-// ---------- SeDebugPrivilege ----------
-// LocalSystem holds SeDebugPrivilege, but it may be disabled by default.
-// Enabling it is required to reliably open and modify affinity of processes
-// running in interactive user sessions.
-
-use windows::core::w;
-use windows::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, LUID, WIN32_ERROR, ERROR_NOT_ALL_ASSIGNED};
-use windows::Win32::Security::{
-    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES,
-    TOKEN_PRIVILEGES, TOKEN_QUERY, SE_PRIVILEGE_ENABLED,
-};
-use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcessToken,
-};
-
-fn enable_debug_privilege() -> Result<(), String> {
-    unsafe {
-        let mut token = Default::default();
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-            &mut token,
-        )
-        .map_err(|e| format!("OpenProcessToken: {e}"))?;
-
-        let mut luid = LUID::default();
-        let lookup_result = LookupPrivilegeValueW(None, w!("SeDebugPrivilege"), &mut luid);
-        if let Err(error) = lookup_result {
-            let _ = CloseHandle(token);
-            return Err(format!("LookupPrivilegeValueW(SeDebugPrivilege): {error}"));
-        }
-
-        let privileges = TOKEN_PRIVILEGES {
-            PrivilegeCount: 1,
-            Privileges: [LUID_AND_ATTRIBUTES {
-                Luid: luid,
-                Attributes: SE_PRIVILEGE_ENABLED,
-            }],
-        };
-        SetLastError(WIN32_ERROR(0));
-        let adjust_result = AdjustTokenPrivileges(
-            token,
-            false,
-            Some(&privileges),
-            0,
-            None,
-            None,
-        );
-        let last_error = GetLastError();
-        let _ = CloseHandle(token);
-
-        adjust_result.map_err(|e| format!("AdjustTokenPrivileges: {e}"))?;
-        if last_error == ERROR_NOT_ALL_ASSIGNED {
-            return Err("current service account does not hold SeDebugPrivilege".to_string());
-        }
-    }
-    Ok(())
-}
 
 // ---------- Windows Service main loop ----------
 
@@ -115,7 +64,7 @@ fn service_main(arguments: Vec<OsString>) {
     let rules_dir = arguments
         .get(1)
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(RULES_DIR));
+        .unwrap_or_else(|| std::path::PathBuf::from(LEGACY_RULES_DIR));
 
     if let Err(e) = run_service(rules_dir) {
         eprintln!("Service fatal: {e}");
@@ -123,8 +72,14 @@ fn service_main(arguments: Vec<OsString>) {
 }
 
 fn run_service(rules_dir: std::path::PathBuf) -> WinSvcResult<()> {
-    enable_debug_privilege()
+    cpum_core::procwin::enable_debug_privilege()
         .map_err(|message| windows_service::Error::Winapi(std::io::Error::other(message)))?;
+
+    // Serve privileged requests from the (un-elevated) GUI. The listener blocks
+    // on a background thread and dies with the process when the service stops.
+    let bridge_dir = rules_dir.clone();
+    std::thread::spawn(move || cpum_core::ipc::serve(bridge_dir));
+
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
 
     let status_handle = service_control_handler::register(
@@ -208,6 +163,59 @@ fn run_service(rules_dir: std::path::PathBuf) -> WinSvcResult<()> {
 
 // ---------- Entry point ----------
 
+// ---------- One-shot privileged helper ----------
+// The GUI runs un-elevated. When it cannot modify a process itself and the
+// service is not installed, it re-launches this binary elevated with one of the
+// subcommands below, so the user gets exactly one UAC prompt for that action.
+
+fn require_debug_privilege() -> Result<(), String> {
+    // An elevated administrator token holds SeDebugPrivilege but starts with it
+    // disabled, so it has to be turned on explicitly.
+    cpum_core::procwin::enable_debug_privilege()
+}
+
+/// `--set-affinity <pid> <mask-csv> <strict|soft>`
+fn one_shot_set_affinity(args: &[String]) -> Result<String, String> {
+    require_debug_privilege()?;
+    let pid: u32 = args
+        .get(2)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| "usage: --set-affinity <pid> <mask-csv> <strict|soft>".to_string())?;
+    let masks: Vec<String> = args
+        .get(3)
+        .map(|value| value.split(',').map(|part| part.trim().to_string()).collect())
+        .unwrap_or_default();
+    let mode = match args.get(4).map(|value| value.as_str()) {
+        Some("soft") => cpum_core::rule::RuleMode::Soft,
+        _ => cpum_core::rule::RuleMode::Strict,
+    };
+    let parsed = cpum_core::procwin::GroupMasks::from_hex_list(&masks)?;
+    cpum_core::procwin::set_affinity_by_group_masks(pid, &parsed.0, mode)?;
+    Ok(format!("affinity applied to PID {pid}"))
+}
+
+/// `--set-priority <pid> <class|-> <io|-> <mem|->`
+fn one_shot_set_priority(args: &[String]) -> Result<String, String> {
+    require_debug_privilege()?;
+    let pid: u32 = args
+        .get(2)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| "usage: --set-priority <pid> <class|-> <io|-> <mem|->".to_string())?;
+    let parse = |index: usize| -> Option<u32> {
+        args.get(index).and_then(|value| value.trim().parse::<u32>().ok())
+    };
+    if let Some(value) = parse(3) {
+        cpum_core::procwin::set_process_priority_class(pid, value)?;
+    }
+    if let Some(value) = parse(4) {
+        cpum_core::procwin::set_process_io_priority(pid, value)?;
+    }
+    if let Some(value) = parse(5) {
+        cpum_core::procwin::set_process_memory_priority(pid, value)?;
+    }
+    Ok(format!("priorities applied to PID {pid}"))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -216,10 +224,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dir = args
             .get(2)
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(RULES_DIR));
+            .unwrap_or_else(|| std::path::PathBuf::from(LEGACY_RULES_DIR));
         let report = engine::apply_rules_from_dir(&dir)?;
         println!("Applied: {} ok, {} failed", report.applied, report.failed);
         return Ok(());
+    }
+
+    // Elevated one-shot helpers used as the GUI's last-resort fallback.
+    match args.get(1).map(|s| s.as_str()) {
+        Some("--set-affinity") => {
+            match one_shot_set_affinity(&args) {
+                Ok(message) => println!("{message}"),
+                Err(message) => {
+                    eprintln!("{message}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        Some("--set-priority") => {
+            match one_shot_set_priority(&args) {
+                Ok(message) => println!("{message}"),
+                Err(message) => {
+                    eprintln!("{message}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
     }
 
     // Normal mode: run as a Windows service.

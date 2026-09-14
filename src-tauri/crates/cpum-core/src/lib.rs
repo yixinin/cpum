@@ -20,8 +20,12 @@
 //!                   foreground process identification)
 //! - [`probalance`]: Dynamic optimization engine (contention detection ->
 //!                   background downgrade -> automatic restore)
+//! - [`ipc`]:        Privileged bridge protocol (un-elevated GUI <-> the
+//!                   LocalSystem service) used when a process cannot be
+//!                   modified with the user's own privileges
 
 pub mod engine;
+pub mod ipc;
 pub mod matcher;
 pub mod monitor;
 pub mod probalance;

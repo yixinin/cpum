@@ -28,8 +28,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [[bin]]
 name = "cpum"
 path = "src/main.rs"
-# The desktop executable embeds a requireAdministrator manifest and contains
-# no unit tests. Running its generated test harness fails with Windows 740.
+# The desktop executable runs with the privileges of the invoking user
+# (asInvoker manifest) and contains no unit tests. Service management commands
+# re-launch sc.exe elevated instead of requiring the whole app to be elevated.
 test = false
 
 [build-dependencies]

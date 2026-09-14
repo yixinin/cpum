@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
 import type { ProcessInfo, CpuScaleMode } from "./types";
 import { refreshDisplayCache, formatMemory, priorityClassLabel, ioPriorityLabel, memoryPriorityLabel, priorityClassColor } from "./types";
-import { getServiceStatus, getProcessExePath, getLogicalProcessorUsage, installService, uninstallService, startService, stopService, type ServiceStatus, type AffinityRule } from "./api";
+import { getServiceStatus, getBridgeStatus, getProcessExePath, getLogicalProcessorUsage, installService, uninstallService, startService, stopService, type ServiceStatus, type BridgeStatus, type AffinityRule } from "./api";
 import type { LogicalProcessorUsage } from "./types";
 import type { SortItem, ViewMode } from "./constants";
 import { useTopology } from "./composables/useTopology";
@@ -154,6 +154,7 @@ const pbPanelOpen = ref(false);
 // Service management
 const serviceDialogOpen = ref(false);
 const serviceStatus = ref<ServiceStatus>("not_installed");
+const bridgeStatus = ref<BridgeStatus>("unavailable");
 const serviceLoading = ref(false);
 const serviceMessage = ref("");
 
@@ -427,12 +428,21 @@ async function refreshServiceStatus() {
   serviceLoading.value = true;
   try {
     serviceStatus.value = await getServiceStatus();
+    try {
+      bridgeStatus.value = await getBridgeStatus();
+    } catch {
+      bridgeStatus.value = "unavailable";
+    }
   } catch (e: any) {
     serviceMessage.value = t("queryFailed", { error: String(e) });
   } finally {
     serviceLoading.value = false;
   }
 }
+
+const bridgeStatusText = computed(() =>
+  bridgeStatus.value === "connected" ? t("bridgeConnected") : t("bridgeUnavailable")
+);
 
 async function openServiceDialog() {
   serviceDialogOpen.value = true;
@@ -758,8 +768,17 @@ async function doStopService() {
             density="compact" variant="tonal" class="mb-4"
             :text="serviceStatusText" />
 
-          <p class="text-body-2 text-medium-emphasis mb-4">
+          <p class="text-body-2 text-medium-emphasis mb-2">
             {{ t('serviceDesc') }}
+          </p>
+
+          <p class="text-caption text-medium-emphasis mb-2">
+            {{ t('serviceElevationHint') }}
+          </p>
+
+          <p class="text-caption mb-4"
+            :class="bridgeStatus === 'connected' ? 'text-success' : 'text-medium-emphasis'">
+            {{ bridgeStatusText }}
           </p>
 
           <v-alert v-if="serviceMessage" type="info" density="compact" variant="outlined" class="mb-3" closable
