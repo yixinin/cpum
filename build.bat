@@ -26,15 +26,33 @@ if errorlevel 1 (
 popd
 
 echo [4/5] Building NSIS installer...
-if exist "%UPDATER_KEY%" (
-  echo       Found %UPDATER_KEY% - updater artifacts (.nsis.zip and .sig) will be signed.
-  set "TAURI_SIGNING_PRIVATE_KEY_PATH=%UPDATER_KEY%"
-  call npx tauri build --bundles nsis
-) else (
-  echo       No %UPDATER_KEY% found - skipping updater signing. Generate one with
-  echo       "npx tauri signer generate -w %UPDATER_KEY%" to enable local signing.
-  call npx tauri build --bundles nsis --config "{\"bundle\":{\"createUpdaterArtifacts\":false}}"
-)
+if not exist "%UPDATER_KEY%" goto :nsi_no_key
+
+echo       Found %UPDATER_KEY% - updater artifacts ^(.nsis.zip and .sig^) can be signed.
+rem The CLI reads TAURI_SIGNING_PRIVATE_KEY and accepts either the key content or
+rem the path to the key file. The path must be absolute because the CLI switches
+rem its working directory to src-tauri before bundling.
+set "TAURI_SIGNING_PRIVATE_KEY=%ROOT%%UPDATER_KEY%"
+rem A key created by `tauri signer generate` is password protected. Without the
+rem password the CLI stops at an interactive prompt, which hangs a
+rem non-interactive build forever, so refuse to sign and say so instead.
+if defined TAURI_SIGNING_PRIVATE_KEY_PASSWORD goto :nsi_signed
+echo       WARNING: TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not set, so updater
+echo                artifacts ^(.nsis.zip and .sig^) will NOT be produced.
+echo                Set that variable and re-run to sign them.
+
+:nsi_no_key
+if not exist "%UPDATER_KEY%" echo       No %UPDATER_KEY% found - skipping updater signing. Generate one with
+if not exist "%UPDATER_KEY%" echo       "npx tauri signer generate -w %UPDATER_KEY%" to enable local signing.
+
+:nsi_unsigned
+call npx tauri build --bundles nsis --config "{\"bundle\":{\"createUpdaterArtifacts\":false}}"
+goto :nsi_built
+
+:nsi_signed
+call npx tauri build --bundles nsis
+
+:nsi_built
 if errorlevel 1 goto :failed
 
 echo [5/5] Collecting updater artifacts and writing SHA256SUMS...
